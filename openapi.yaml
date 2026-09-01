@@ -1,0 +1,1228 @@
+openapi: 3.1.0
+
+info:
+  title: CareRoute Auth & Data API
+  version: "2026.09.01"
+  description: |
+    Backend API for the **CareRoute React Native app**. The RN app never calls
+    Salesforce directly — every read and write goes through this Express/TypeScript
+    service, which holds the Salesforce integration-user credentials and proxies
+    each request to the appropriate Apex REST endpoint in the CareRoute Salesforce
+    org. Firebase Authentication + Firestore are used for phone/OTP verification
+    and password credential storage; Salesforce is the system of record for
+    Contacts, Accounts, subscriptions, wallets, and medical records.
+
+    ## Two-step token flow (required reading before calling anything else)
+
+    Every sign-in path (`POST /otp/verify` or `POST /login`) returns a Firebase
+    **custom token** in the response body — this is NOT a usable API credential by
+    itself. The RN app must feed that custom token into the Firebase Auth SDK's
+    `signInWithCustomToken()`, which exchanges it for a real Firebase **ID token**
+    (a JWT). It is that ID token — not the custom token — that goes in the
+    `Authorization: Bearer <idToken>` header on every other endpoint below that
+    requires authentication. Sending the raw custom token as a Bearer token will
+    fail `admin.auth().verifyIdToken()` on the server and return 401.
+
+    Once a user completes `POST /register` (as a sponsor) or `POST /dependent/claim`
+    (as a claimed dependent), the server attaches `contactId`, `accountId`, and
+    `role` as Firebase custom claims on that user. These claims are baked into every
+    ID token minted for that user from then on (the RN app may need to force-refresh
+    its cached ID token after registering/claiming to pick them up). See
+    `CallerIdentity` under Components → Schemas for what these claims mean — every
+    endpoint tagged "Account Data (Tier 1)", "My Profile", or "Dependents" (register)
+    depends on them being present, and returns `403 Registration incomplete` if
+    they're missing.
+
+    ## Known current limitations (affect API consumers directly)
+
+    - **Subscription status always shows `"Pending"`.** `GET /subscription/status`
+      is wired up end-to-end, but no payment/wallet-funding flow exists elsewhere in
+      the system yet to move an Account out of that state. Don't build RN UI that
+      assumes any other status is reachable today.
+    - **Medical record access for Doctor/Nurse roles is implemented but untestable.**
+      `GET /medical-record` accepts calls from any role with a valid `CallerIdentity`,
+      including provider roles, but there is currently no provider registration flow
+      to actually mint a Doctor/Nurse-role account — so that code path has not been
+      exercised end-to-end.
+    - **Wallet balance is Sponsor-role only.** `GET /wallet/balance` returns `403`
+      for any caller whose role isn't Sponsor (e.g. a claimed dependent), since
+      dependents don't hold their own wallet.
+
+  contact:
+    name: CareRoute Engineering
+
+servers:
+  - url: "https://careroute-firebase.onrender.com"
+    description: Production (Render).
+  # Local development note (not a live server, kept here for context only):
+  # This project previously ran locally against the Firebase Functions emulator
+  # (`npm run serve` inside functions/, serving from a
+  # 127.0.0.1:5001/<project>/<region>/api style URL). As of the Render migration
+  # reflected in functions/src/index.ts (a plain `express().listen(process.env.PORT)`
+  # app, no more firebase-functions `onRequest` wrapper), the project deploys via
+  # Render only — there is no supported local emulator flow anymore. To run it
+  # locally today, set the required env vars (FIREBASE_SERVICE_ACCOUNT_JSON,
+  # SF_JWT_PRIVATE_KEY, SF_CONSUMER_KEY, SF_INTEGRATION_USERNAME, AT_API_KEY,
+  # AT_USERNAME) and run the compiled server directly on a port of your choosing.
+
+security: []
+
+tags:
+  - name: OTP
+    description: Phone-based one-time-code sign-in. No Authorization header required.
+  - name: Password
+    description: Set/change a password credential, log in with phone + password, and recover a forgotten password.
+  - name: Sponsor Registration
+    description: Turn a verified Firebase account into a Salesforce Sponsor, with a password.
+  - name: Dependents
+    description: >-
+      Sponsors register dependents by phone number; each dependent later claims
+      their own profile under a SEPARATE Firebase identity (their own phone, their
+      own OTP + ID token) — never the sponsor's.
+  - name: My Profile
+    description: The caller's own Salesforce profile.
+  - name: Account Data (Tier 1)
+    description: Read-only account data proxied to Salesforce, gated on the caller's CallerIdentity claims.
+  - name: Health Checks
+    description: Unauthenticated liveness/connectivity checks.
+
+paths:
+  /health:
+    get:
+      tags: [Health Checks]
+      operationId: getHealth
+      summary: Liveness check
+      description: >-
+        Basic liveness check for the Express app itself — touches no external
+        dependencies. Nothing needs to happen before calling this.
+      security: []
+      responses:
+        "200":
+          description: The service is up.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+              example:
+                status: ok
+                time: "2026-09-01T12:00:00.000Z"
+
+  /sf-health:
+    get:
+      tags: [Health Checks]
+      operationId: getSalesforceHealth
+      summary: Salesforce connectivity check
+      description: >-
+        Confirms the Salesforce JWT Bearer flow works end-to-end: exchanges the
+        integration user's signed JWT for a Salesforce access token and calls
+        Salesforce's `/limits` endpoint. No Authorization header is required on
+        this endpoint itself, but the server's own Salesforce credentials
+        (SF_JWT_PRIVATE_KEY / SF_CONSUMER_KEY / SF_INTEGRATION_USERNAME, or the
+        equivalent Secret Manager secrets) must be valid for it to succeed. Useful
+        as a first diagnostic step whenever a 502 shows up elsewhere.
+      security: []
+      responses:
+        "200":
+          description: Salesforce JWT Bearer exchange succeeded.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SalesforceHealthStatus"
+              example:
+                status: connected
+                instanceUrl: "https://careroute--sandbox.sandbox.my.salesforce.com"
+                sampleLimit: 15000
+        "500":
+          description: The JWT Bearer exchange or the Salesforce `/limits` call failed.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, message]
+                properties:
+                  status: { type: string, const: error }
+                  message: { type: string }
+              example:
+                status: error
+                message: "Salesforce JWT Bearer exchange failed: 400 invalid_grant"
+
+  /otp/request:
+    post:
+      tags: [OTP]
+      operationId: requestOtp
+      summary: Send a phone verification code
+      description: >-
+        Sends a 6-digit SMS verification code (via Africa's Talking) to `phone`.
+        The code expires after 5 minutes and is rate-limited to one request per
+        phone number per 60 seconds. This is the entry point of both the Sponsor
+        and the Dependent sign-in flows — nothing needs to happen before calling
+        it.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phone]
+              properties:
+                phone:
+                  type: string
+                  description: E.164 phone number to send the code to.
+                  example: "+231770000001"
+            example:
+              phone: "+231770000001"
+      responses:
+        "200":
+          description: Code sent.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessResponse"
+              example:
+                success: true
+        "400":
+          description: "`phone` was missing from the request body."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: phone is required
+        "429":
+          description: A code was already requested for this phone number within the last 60 seconds.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: Please wait before requesting another code
+
+  /otp/verify:
+    post:
+      tags: [OTP]
+      operationId: verifyOtp
+      summary: Verify a phone code and receive a custom token
+      description: >-
+        Verifies the code sent by `POST /otp/request` for the same `phone`. On
+        success, finds or creates the Firebase Auth user for this phone number and
+        returns a Firebase **custom token** — see the top-level "Two-step token
+        flow" note: this must be exchanged client-side for a real ID token before
+        it can be used as a Bearer credential anywhere else in this API.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phone, code]
+              properties:
+                phone:
+                  type: string
+                  description: The same E.164 phone number a code was requested for.
+                  example: "+231770000001"
+                code:
+                  type: string
+                  description: The 6-digit code received by SMS.
+                  example: "482913"
+            example:
+              phone: "+231770000001"
+              code: "482913"
+      responses:
+        "200":
+          description: Code verified.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CustomTokenResponse"
+              example:
+                customToken: "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.<...firebase-custom-token...>"
+        "400":
+          description: Missing fields, or the code was wrong/expired/exhausted/never requested.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                missingFields:
+                  summary: phone or code missing
+                  value: { error: "phone and code are required" }
+                noCode:
+                  summary: No code was ever requested for this phone
+                  value: { error: "No verification code found — request a new one" }
+                expired:
+                  summary: Code expired (>5 minutes old)
+                  value: { error: "Verification code expired — request a new one" }
+                tooManyAttempts:
+                  summary: 5th wrong attempt — code invalidated
+                  value: { error: "Too many attempts — request a new code" }
+                wrongCode:
+                  summary: Code doesn't match
+                  value: { error: "Incorrect code" }
+
+  /set-password:
+    post:
+      tags: [Password]
+      operationId: setPassword
+      summary: Set (or overwrite) the password credential
+      description: >-
+        Sets the password credential for the account tied to the verified phone
+        number on the presented ID token. A standalone credentials endpoint,
+        separate from `POST /register` and `POST /dependent/claim`, which each set
+        their own password as part of registering/claiming — useful for changing a
+        password without going through the recovery flow.
+
+        Requires an ID token from a completed OTP verify → custom-token exchange
+        whose account has a verified `phone_number` claim.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [password]
+              properties:
+                password:
+                  type: string
+                  minLength: 8
+                  description: New password, at least 8 characters.
+                  example: "SuperSecret123!"
+            example:
+              password: "SuperSecret123!"
+      responses:
+        "200":
+          description: Password set.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessResponse"
+              example:
+                success: true
+        "400":
+          description: Password missing/too short, or the token has no verified phone number.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                badPassword:
+                  value: { error: "password is required and must be at least 8 characters" }
+                noPhone:
+                  value: { error: "No verified phone number on this account" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /login:
+    post:
+      tags: [Password]
+      operationId: login
+      summary: Log in with phone + password
+      description: >-
+        Standalone phone + password login for returning users who already have a
+        password set (via `POST /set-password`, `POST /register`, or
+        `POST /dependent/claim`). Locks the account for 15 minutes after 5
+        consecutive failed attempts. Like `POST /otp/verify`, the returned custom
+        token must be exchanged for an ID token before use as a Bearer credential.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phone, password]
+              properties:
+                phone:
+                  type: string
+                  example: "+231770000001"
+                password:
+                  type: string
+                  example: "SuperSecret123!"
+            example:
+              phone: "+231770000001"
+              password: "SuperSecret123!"
+      responses:
+        "200":
+          description: Credentials valid.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CustomTokenResponse"
+              example:
+                customToken: "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.<...firebase-custom-token...>"
+        "400":
+          description: "`phone` or `password` missing from the request body."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: phone and password are required
+        "401":
+          description: No credential record for this phone, wrong password, or the account is temporarily locked.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                invalid:
+                  summary: No matching phone, or wrong password
+                  value: { error: "Invalid credentials" }
+                locked:
+                  summary: 5 failed attempts within the lockout window
+                  value: { error: "Account temporarily locked — try again later" }
+
+  /recover/reset-password:
+    post:
+      tags: [Password]
+      operationId: resetPassword
+      summary: Reset password via verified phone ownership
+      description: >-
+        The password-recovery equivalent of `POST /set-password`: resets the
+        password for the account tied to the verified phone number on the
+        presented ID token, instead of requiring the old password. Requires a
+        FRESH ID token from a completed OTP verify → custom-token exchange,
+        proving the caller currently owns the phone number — that proof-of-phone
+        is how recovery is authenticated here.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [newPassword]
+              properties:
+                newPassword:
+                  type: string
+                  minLength: 8
+                  example: "AnotherSecret456!"
+            example:
+              newPassword: "AnotherSecret456!"
+      responses:
+        "200":
+          description: Password reset.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessResponse"
+              example:
+                success: true
+        "400":
+          description: newPassword missing/too short, or the token has no verified phone number.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                badPassword:
+                  value: { error: "newPassword is required and must be at least 8 characters" }
+                noPhone:
+                  value: { error: "No verified phone number on this account" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /register:
+    post:
+      tags: [Sponsor Registration]
+      operationId: registerSponsor
+      summary: Register the caller as a Sponsor
+      description: >-
+        Registers the caller as a Sponsor in Salesforce via the JWT Bearer
+        integration user, then — only if that succeeds — sets the account's
+        password locally and attaches `contactId`, `accountId`, and `role` as
+        Firebase custom claims (see `CallerIdentity`) on the user. `firstName`,
+        `country`, and `password` are required; `phone` in the body is only used
+        as a fallback if the ID token itself has no verified `phone_number`.
+
+        Salesforce registration is the gate: if it fails (502), nothing else
+        happens and no password is stored. Custom claims are only set after both
+        the Salesforce call and the password write succeed — an ID token obtained
+        BEFORE this call completes won't carry them yet, so the RN app should
+        force-refresh (or re-run the token exchange) afterward to get a token that
+        satisfies the `CallerIdentity` checks on every other protected endpoint.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [firstName, country, password]
+              properties:
+                firstName: { type: string, example: "Kim" }
+                lastName: { type: string, example: "Danladi" }
+                email: { type: string, format: email, example: "kimdanladi@gmail.com" }
+                city: { type: string, example: "Monrovia" }
+                country: { type: string, example: "Liberia" }
+                phone:
+                  type: string
+                  description: >-
+                    Fallback phone number, only used if the ID token has no
+                    verified phone_number claim.
+                  example: "+231770000001"
+                password:
+                  type: string
+                  minLength: 8
+                  example: "SuperSecret123!"
+            example:
+              firstName: "Kim"
+              lastName: "Danladi"
+              email: "kimdanladi@gmail.com"
+              city: "Monrovia"
+              country: "Liberia"
+              phone: "+231770000001"
+              password: "SuperSecret123!"
+      responses:
+        "200":
+          description: Sponsor registered in Salesforce and password set.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RegistrationResult"
+              example:
+                contactId: "003XX000004TmiQQAS"
+                accountId: "001XX000003DHPh QAO"
+                role: "Sponsor"
+                wasExisting: false
+        "400":
+          description: A required field is missing, or password is too short.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                missingFields:
+                  value: { error: "Missing required fields: phone (or verified token phone), firstName, country, and password are all required" }
+                shortPassword:
+                  value: { error: "password must be at least 8 characters" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          description: Unexpected error contacting Salesforce, or Salesforce succeeded but the local password write failed.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/Error"
+                  - $ref: "#/components/schemas/PartialSuccessError"
+              examples:
+                sfError:
+                  summary: Could not reach Salesforce at all
+                  value: { error: "Internal error contacting Salesforce" }
+                passwordWriteFailed:
+                  summary: Salesforce Contact was created but the password could not be stored
+                  value:
+                    error: "Account created but password could not be set — please try setting your password again"
+                    contactId: "003XX000004TmiQQAS"
+        "502":
+          description: The Salesforce Apex REST call itself returned a non-2xx response.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorWithDetail"
+              example:
+                error: "Registration failed on Salesforce side"
+                detail: "{\"message\":\"DUPLICATE_VALUE\"}"
+
+  /dependent/register:
+    post:
+      tags: [Dependents]
+      operationId: registerDependent
+      summary: Register a dependent under the caller's Sponsor account
+      description: >-
+        Registers a new dependent Contact under the CALLING Sponsor's Salesforce
+        Account. `firstName`, `dateOfBirth`, and `phone` are required. Use a phone
+        number DIFFERENT from the sponsor's own — that number is how the dependent
+        will later claim this profile themselves via `POST /dependent/claim`.
+
+        Requires an ID token belonging to a Sponsor who has already completed
+        `POST /register` (i.e. whose token carries the `contactId`/`accountId`/
+        `role` claims described in `CallerIdentity`) — a token missing those claims
+        gets `403 Registration incomplete`.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [firstName, dateOfBirth, phone]
+              properties:
+                firstName: { type: string, example: "Anthony" }
+                lastName: { type: string, example: "Danladi" }
+                dateOfBirth:
+                  type: string
+                  format: date
+                  example: "2015-04-12"
+                phone:
+                  type: string
+                  description: >-
+                    Must be different from the sponsor's own phone number — this
+                    is the number the dependent will use to claim this profile.
+                  example: "+231770000002"
+                email: { type: string, format: email, example: "anthony.dependent@example.com" }
+            example:
+              firstName: "Anthony"
+              lastName: "Danladi"
+              dateOfBirth: "2015-04-12"
+              phone: "+231770000002"
+              email: "anthony.dependent@example.com"
+      responses:
+        "200":
+          description: Dependent registered.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DependentRecord"
+        "400":
+          description: A required field is missing.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: "firstName, dateOfBirth, and phone are all required"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: >-
+            The caller's token is missing `contactId`/`accountId` claims (see
+            `CallerIdentity`), or Salesforce rejected the call for the caller's role.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                registrationIncomplete:
+                  value: { error: "Registration incomplete" }
+                sfForbidden:
+                  value: { error: "Failed to register dependent", detail: "Forbidden for this role" }
+        "409":
+          description: A dependent already exists for that phone number under this Account.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorWithDetail"
+              example:
+                error: "Failed to register dependent"
+                detail: "DUPLICATE_DEPENDENT_PHONE"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "502":
+          description: The Salesforce Apex REST call returned an unexpected non-2xx response.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorWithDetail"
+              example:
+                error: "Failed to register dependent"
+                detail: "INTERNAL_SERVER_ERROR"
+
+  /dependent/claim:
+    post:
+      tags: [Dependents]
+      operationId: claimDependent
+      summary: Claim a pre-registered dependent profile as its own Firebase identity
+      description: >-
+        ⚠️ SEPARATE IDENTITY FROM THE SPONSOR. Before calling this, the dependent
+        must sign in as THEMSELVES: `POST /otp/request` → `POST /otp/verify` → the
+        client-side custom-token-for-ID-token exchange, using the phone number the
+        sponsor registered them with in `POST /dependent/register` — NOT the
+        sponsor's phone. The resulting ID token, for the dependent's OWN Firebase
+        account, is what must be presented as the Bearer token here; the sponsor's
+        ID token will not work (it has no matching unclaimed dependent record for
+        its own phone number).
+
+        On success, this looks up a Salesforce dependent record matching the
+        verified phone number on the token, links it to this Firebase uid, stores
+        the given `password` as this account's credential, and attaches
+        `contactId`/`accountId`/`role` custom claims (see `CallerIdentity`) — after
+        this, the dependent can `POST /login` with their own phone + password just
+        like a Sponsor.
+
+        Requires a verified `phone_number` claim on the token (i.e. a completed OTP
+        verification for the dependent's own number) and a matching, not-yet-claimed
+        dependent record already created via `POST /dependent/register`.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [password]
+              properties:
+                password:
+                  type: string
+                  minLength: 8
+                  example: "DependentPass456!"
+            example:
+              password: "DependentPass456!"
+      responses:
+        "200":
+          description: Dependent record claimed and linked to this Firebase account.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RegistrationResult"
+              example:
+                contactId: "003XX000004TmiRQAS"
+                accountId: "001XX000003DHPhQAO"
+                role: "Dependent"
+                wasExisting: true
+        "400":
+          description: Password missing/too short, or the token has no verified phone number.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                noPhone:
+                  value: { error: "No verified phone number on this account" }
+                badPassword:
+                  value: { error: "password is required and must be at least 8 characters" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: >-
+            No unclaimed dependent record exists in Salesforce for this phone
+            number — run `POST /dependent/register` (as the sponsor) first.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorWithDetail"
+              example:
+                error: "Claim failed"
+                detail: "NOT_FOUND"
+        "500":
+          description: >-
+            Could not reach Salesforce at all, or the claim succeeded on the
+            Salesforce side but the local password write failed.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/Error"
+                  - $ref: "#/components/schemas/PartialSuccessError"
+              examples:
+                sfError:
+                  summary: Could not reach Salesforce at all
+                  value: { error: "Internal error contacting Salesforce" }
+                passwordWriteFailed:
+                  summary: Salesforce link succeeded but the password could not be stored
+                  value:
+                    error: "Profile linked but password could not be set — please try again"
+                    contactId: "003XX000004TmiRQAS"
+        "502":
+          description: The Salesforce Apex REST call returned an unexpected non-2xx, non-404 response.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorWithDetail"
+              example:
+                error: "Claim failed"
+                detail: "INTERNAL_SERVER_ERROR"
+
+  /me:
+    get:
+      tags: [My Profile]
+      operationId: getMyProfile
+      summary: Get the caller's own profile
+      description: >-
+        Returns the caller's own Salesforce profile (Contact/Account details) —
+        works for both Sponsor and Dependent (Patient) roles, whichever identity's
+        ID token is presented.
+
+        Requires an ID token carrying `contactId`/`accountId` claims (see
+        `CallerIdentity`), i.e. a completed `POST /register` or
+        `POST /dependent/claim`.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Profile found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProfileRecord"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/RegistrationIncomplete"
+        "404":
+          description: No matching profile found in Salesforce for this caller.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorWithDetail"
+              example:
+                error: "Failed to fetch profile"
+                detail: "NOT_FOUND"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "502":
+          description: The Salesforce Apex REST call returned an unexpected non-2xx, non-404 response.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorWithDetail"
+              example:
+                error: "Failed to fetch profile"
+                detail: "INTERNAL_SERVER_ERROR"
+
+  /subscription/status:
+    get:
+      tags: [Account Data (Tier 1)]
+      operationId: getSubscriptionStatus
+      summary: Get the caller's Account subscription status
+      description: >-
+        Returns the subscription status for the caller's Salesforce Account.
+
+        **Known limitation:** the returned `status` will currently always be
+        `"Pending"`, since no payment/wallet-funding flow exists yet to move an
+        Account out of that state.
+
+        Requires an ID token carrying `contactId`/`accountId` claims (see
+        `CallerIdentity`).
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Subscription status retrieved.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubscriptionStatus"
+              example:
+                status: "Pending"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/RegistrationIncomplete"
+        "404":
+          description: No subscription record found on the Account.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorWithDetail"
+              example:
+                error: "Failed to fetch subscription status"
+                detail: "NOT_FOUND"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "502":
+          description: The Salesforce Apex REST call returned an unexpected non-2xx, non-404 response.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorWithDetail"
+              example:
+                error: "Failed to fetch subscription status"
+                detail: "INTERNAL_SERVER_ERROR"
+
+  /wallet/balance:
+    get:
+      tags: [Account Data (Tier 1)]
+      operationId: getWalletBalance
+      summary: Get the caller's Account wallet balance
+      description: >-
+        Returns the wallet balance for the caller's Salesforce Account.
+
+        **Known limitation:** this endpoint is Sponsor-role only — a Dependent
+        (Patient)-role caller currently gets `403`, since dependents don't hold
+        their own wallet.
+
+        Requires an ID token carrying `contactId`/`accountId` claims (see
+        `CallerIdentity`).
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Wallet balance retrieved.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WalletBalance"
+              example:
+                balance: 25.5
+                currency: "USD"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: >-
+            The caller's token is missing `contactId`/`accountId` claims, OR the
+            caller's role is not entitled to a wallet (i.e. not a Sponsor).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                registrationIncomplete:
+                  value: { error: "Registration incomplete" }
+                notEntitled:
+                  summary: Caller role (e.g. a claimed dependent) has no wallet
+                  value: { error: "Failed to fetch wallet balance", detail: "FORBIDDEN" }
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "502":
+          description: The Salesforce Apex REST call returned an unexpected non-2xx, non-403 response.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorWithDetail"
+              example:
+                error: "Failed to fetch wallet balance"
+                detail: "INTERNAL_SERVER_ERROR"
+
+  /medical-record:
+    get:
+      tags: [Account Data (Tier 1)]
+      operationId: getMedicalRecord
+      summary: Get a patient's medical record
+      description: >-
+        Returns the medical record for the patient identified by the required
+        `patientContactId` query parameter.
+
+        `patientContactId` must be either: the caller's OWN contactId (if the
+        caller is a Patient/Dependent), or a DEPENDENT's contactId under the
+        caller's own Account (if the caller is a Sponsor). Sponsor-role responses
+        omit the `knownConditions` and `knownAllergies` fields that a
+        Patient/Dependent viewing their own record would see.
+
+        **Known limitation:** Doctor/Nurse-role access to this endpoint is
+        implemented server-side but currently untestable — there is no provider
+        registration flow yet to mint a Doctor/Nurse-role `CallerIdentity`.
+
+        Requires an ID token carrying `contactId`/`accountId` claims (see
+        `CallerIdentity`).
+      parameters:
+        - name: patientContactId
+          in: query
+          required: true
+          description: Salesforce Contact Id of the patient whose record to fetch.
+          schema:
+            type: string
+          example: "003XX000004TmiRQAS"
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Medical record retrieved.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MedicalRecord"
+        "400":
+          description: "`patientContactId` query parameter was missing."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: "patientContactId query parameter is required"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: >-
+            The caller's token is missing `contactId`/`accountId` claims, OR
+            `patientContactId` is not the caller's own contactId and not a
+            dependent's contactId under the caller's Account.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                registrationIncomplete:
+                  value: { error: "Registration incomplete" }
+                notOwned:
+                  summary: patientContactId isn't the caller's own or a dependent's
+                  value: { error: "Failed to fetch medical record", detail: "FORBIDDEN" }
+        "404":
+          description: >-
+            No medical record exists yet for that Contact — expected until one is
+            created (there is no create-record endpoint in this API).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorWithDetail"
+              example:
+                error: "Failed to fetch medical record"
+                detail: "NOT_FOUND"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "502":
+          description: The Salesforce Apex REST call returned an unexpected non-2xx, non-403, non-404 response.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorWithDetail"
+              example:
+                error: "Failed to fetch medical record"
+                detail: "INTERNAL_SERVER_ERROR"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >-
+        A Firebase **ID token** (never the custom token returned by
+        `POST /otp/verify` or `POST /login` — see the top-level "Two-step token
+        flow" note). The server verifies it with `admin.auth().verifyIdToken()`.
+        Its decoded payload may carry `contactId`, `accountId`, and `role` custom
+        claims — see `CallerIdentity` — which several endpoints additionally
+        require to be present, returning `403 Registration incomplete` otherwise.
+
+  schemas:
+    HealthStatus:
+      type: object
+      required: [status, time]
+      properties:
+        status: { type: string, const: ok }
+        time: { type: string, format: date-time }
+
+    SalesforceHealthStatus:
+      type: object
+      required: [status, instanceUrl, sampleLimit]
+      properties:
+        status: { type: string, const: connected }
+        instanceUrl: { type: string, format: uri }
+        sampleLimit:
+          type: integer
+          description: "Sampled from Salesforce's DailyApiRequests limit, as a connectivity smoke test."
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: Human-readable error message.
+
+    ErrorWithDetail:
+      description: >-
+        An Error whose `detail` field carries the raw response body (or a short
+        code) from the upstream Salesforce Apex REST call.
+      allOf:
+        - $ref: "#/components/schemas/Error"
+        - type: object
+          properties:
+            detail:
+              type: string
+
+    PartialSuccessError:
+      description: >-
+        Returned when a Salesforce write (registration or dependent claim)
+        succeeded but a subsequent local step (storing the password) failed —
+        the Salesforce Contact/link already exists even though this is an error
+        response.
+      allOf:
+        - $ref: "#/components/schemas/Error"
+        - type: object
+          required: [contactId]
+          properties:
+            contactId:
+              type: string
+              description: The Salesforce Contact Id that was successfully created/linked.
+
+    SuccessResponse:
+      type: object
+      required: [success]
+      properties:
+        success: { type: boolean, const: true }
+
+    CustomTokenResponse:
+      type: object
+      required: [customToken]
+      properties:
+        customToken:
+          type: string
+          description: >-
+            A Firebase custom token. Not usable directly as a Bearer credential —
+            see the top-level "Two-step token flow" note.
+
+    CallerIdentity:
+      description: >-
+        Not a request/response body — this documents the Firebase custom claims
+        embedded in the JWT payload of a caller's ID token, which the server reads
+        via `admin.auth().verifyIdToken()` and checks on most protected endpoints.
+        These claims are set once by `POST /register` (Sponsor) or
+        `POST /dependent/claim` (Dependent), and are absent on any ID token minted
+        before that completes. An endpoint that requires them returns
+        `403 { "error": "Registration incomplete" }` when `contactId` or
+        `accountId` is missing.
+      type: object
+      properties:
+        contactId:
+          type: string
+          description: Salesforce Contact Id for this caller.
+        accountId:
+          type: string
+          description: Salesforce Account Id this caller's Contact belongs to.
+        role:
+          type: string
+          description: >-
+            The caller's role as assigned by Salesforce at registration/claim
+            time (observed values include "Sponsor" and "Dependent"; Doctor/Nurse
+            roles are supported server-side but not currently mintable — see the
+            top-level known-limitations note).
+          examples: ["Sponsor", "Dependent"]
+        phone_number:
+          type: string
+          description: Standard Firebase Auth claim — the verified E.164 phone number, when present.
+          example: "+231770000001"
+        uid:
+          type: string
+          description: Standard Firebase Auth claim — the Firebase user id.
+
+    RegistrationResult:
+      description: >-
+        Common shape returned by both `POST /register` and
+        `POST /dependent/claim` on success — this is the Salesforce Apex REST
+        response, passed through as-is.
+      type: object
+      required: [contactId, accountId, role, wasExisting]
+      properties:
+        contactId: { type: string }
+        accountId: { type: string }
+        role: { type: string, examples: ["Sponsor", "Dependent"] }
+        wasExisting:
+          type: boolean
+          description: Whether this Contact already existed in Salesforce prior to this call.
+
+    DependentRecord:
+      description: >-
+        Response shape for `POST /dependent/register`, passed through from the
+        Salesforce `dependent/register` Apex REST endpoint as-is. The exact field
+        list is defined by that Apex controller (not present in this repo) —
+        fields below reflect the currently known contract; confirm against the
+        Apex source before relying on any field not listed here.
+      type: object
+      additionalProperties: true
+      properties:
+        contactId: { type: string }
+        accountId: { type: string }
+      example:
+        contactId: "003XX000004TmiRQAS"
+        accountId: "001XX000003DHPhQAO"
+        firstName: "Anthony"
+        lastName: "Danladi"
+        phone: "+231770000002"
+
+    ProfileRecord:
+      description: >-
+        Response shape for `GET /me`, passed through from the Salesforce `me`
+        Apex REST endpoint as-is. The exact field list is defined by that Apex
+        controller (not present in this repo); fields below are illustrative —
+        confirm against the Apex source before relying on any field not listed
+        here.
+      type: object
+      additionalProperties: true
+      properties:
+        contactId: { type: string }
+        accountId: { type: string }
+        role: { type: string }
+        firstName: { type: string }
+        lastName: { type: string }
+      example:
+        contactId: "003XX000004TmiQQAS"
+        accountId: "001XX000003DHPhQAO"
+        role: "Sponsor"
+        firstName: "Kim"
+        lastName: "Danladi"
+
+    SubscriptionStatus:
+      description: >-
+        Response shape for `GET /subscription/status`, passed through from the
+        Salesforce `subscription/status` Apex REST endpoint as-is. The exact
+        field list is defined by that Apex controller (not present in this repo);
+        `status` is confirmed to always currently read `"Pending"` — see the
+        top-level known-limitations note.
+      type: object
+      additionalProperties: true
+      properties:
+        status:
+          type: string
+          example: "Pending"
+
+    WalletBalance:
+      description: >-
+        Response shape for `GET /wallet/balance`, passed through from the
+        Salesforce `wallet/balance` Apex REST endpoint as-is. The exact field
+        list is defined by that Apex controller (not present in this repo);
+        fields below are illustrative — confirm against the Apex source.
+      type: object
+      additionalProperties: true
+      properties:
+        balance: { type: number }
+        currency: { type: string, example: "USD" }
+
+    MedicalRecord:
+      description: >-
+        Response shape for `GET /medical-record`, passed through from the
+        Salesforce `medical-record` Apex REST endpoint as-is. The exact field
+        list is defined by that Apex controller (not present in this repo).
+        `knownConditions` and `knownAllergies` are known to be omitted from
+        Sponsor-role responses (see this endpoint's description) — other fields
+        below are illustrative; confirm against the Apex source.
+      type: object
+      additionalProperties: true
+      properties:
+        patientContactId: { type: string }
+        knownConditions:
+          type: array
+          items: { type: string }
+          nullable: true
+          description: Omitted/absent for Sponsor-role callers.
+        knownAllergies:
+          type: array
+          items: { type: string }
+          nullable: true
+          description: Omitted/absent for Sponsor-role callers.
+      example:
+        patientContactId: "003XX000004TmiRQAS"
+        knownConditions: ["Asthma"]
+        knownAllergies: ["Penicillin"]
+
+  responses:
+    Unauthorized:
+      description: The Authorization header was missing, or the ID token is invalid/expired.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          examples:
+            missingHeader:
+              value: { error: "Missing Authorization header" }
+            invalidToken:
+              value: { error: "Invalid or expired token" }
+
+    RegistrationIncomplete:
+      description: >-
+        The presented ID token does not carry `contactId`/`accountId` claims yet
+        — see `CallerIdentity`. Complete `POST /register` (Sponsor) or
+        `POST /dependent/claim` (Dependent) first.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error: "Registration incomplete"
+
+    InternalError:
+      description: Unexpected server-side error unrelated to Salesforce's response.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error: "Internal error"
