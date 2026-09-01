@@ -71,7 +71,7 @@ tags:
   - name: OTP
     description: Phone-based one-time-code sign-in. No Authorization header required.
   - name: Password
-    description: Set/change a password credential, log in with phone + password, and recover a forgotten password.
+    description: Log in with phone + password, and recover a forgotten password.
   - name: Sponsor Registration
     description: Turn a verified Firebase account into a Salesforce Sponsor, with a password.
   - name: Dependents
@@ -261,60 +261,6 @@ paths:
                   summary: Code doesn't match
                   value: { error: "Incorrect code" }
 
-  /set-password:
-    post:
-      tags: [Password]
-      operationId: setPassword
-      summary: Set (or overwrite) the password credential
-      description: >-
-        Sets the password credential for the account tied to the verified phone
-        number on the presented ID token. A standalone credentials endpoint,
-        separate from `POST /register` and `POST /dependent/claim`, which each set
-        their own password as part of registering/claiming — useful for changing a
-        password without going through the recovery flow.
-
-        Requires an ID token from a completed OTP verify → custom-token exchange
-        whose account has a verified `phone_number` claim.
-      security:
-        - bearerAuth: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [password]
-              properties:
-                password:
-                  type: string
-                  minLength: 8
-                  description: New password, at least 8 characters.
-                  example: "SuperSecret123!"
-            example:
-              password: "SuperSecret123!"
-      responses:
-        "200":
-          description: Password set.
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/SuccessResponse"
-              example:
-                success: true
-        "400":
-          description: Password missing/too short, or the token has no verified phone number.
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-              examples:
-                badPassword:
-                  value: { error: "password is required and must be at least 8 characters" }
-                noPhone:
-                  value: { error: "No verified phone number on this account" }
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-
   /login:
     post:
       tags: [Password]
@@ -322,10 +268,10 @@ paths:
       summary: Log in with phone + password
       description: >-
         Standalone phone + password login for returning users who already have a
-        password set (via `POST /set-password`, `POST /register`, or
-        `POST /dependent/claim`). Locks the account for 15 minutes after 5
-        consecutive failed attempts. Like `POST /otp/verify`, the returned custom
-        token must be exchanged for an ID token before use as a Bearer credential.
+        password set (via `POST /register` or `POST /dependent/claim`). Locks the
+        account for 15 minutes after 5 consecutive failed attempts. Like
+        `POST /otp/verify`, the returned custom token must be exchanged for an ID
+        token before use as a Bearer credential.
       security: []
       requestBody:
         required: true
@@ -381,9 +327,8 @@ paths:
       operationId: resetPassword
       summary: Reset password via verified phone ownership
       description: >-
-        The password-recovery equivalent of `POST /set-password`: resets the
-        password for the account tied to the verified phone number on the
-        presented ID token, instead of requiring the old password. Requires a
+        Resets the password for the account tied to the verified phone number on
+        the presented ID token, without requiring the old password. Requires a
         FRESH ID token from a completed OTP verify → custom-token exchange,
         proving the caller currently owns the phone number — that proof-of-phone
         is how recovery is authenticated here.
@@ -455,9 +400,9 @@ paths:
               type: object
               required: [firstName, country, password]
               properties:
-                firstName: { type: string, example: "Kim" }
-                lastName: { type: string, example: "Danladi" }
-                email: { type: string, format: email, example: "kimdanladi@gmail.com" }
+                firstName: { type: string, example: "John" }
+                lastName: { type: string, example: "Doe" }
+                email: { type: string, format: email, example: "johndoe@example.com" }
                 city: { type: string, example: "Monrovia" }
                 country: { type: string, example: "Liberia" }
                 phone:
@@ -471,9 +416,9 @@ paths:
                   minLength: 8
                   example: "SuperSecret123!"
             example:
-              firstName: "Kim"
-              lastName: "Danladi"
-              email: "kimdanladi@gmail.com"
+              firstName: "John"
+              lastName: "Doe"
+              email: "johndoe@example.com"
               city: "Monrovia"
               country: "Liberia"
               phone: "+231770000001"
@@ -556,7 +501,7 @@ paths:
               required: [firstName, dateOfBirth, phone]
               properties:
                 firstName: { type: string, example: "Anthony" }
-                lastName: { type: string, example: "Danladi" }
+                lastName: { type: string, example: "Doe" }
                 dateOfBirth:
                   type: string
                   format: date
@@ -570,7 +515,7 @@ paths:
                 email: { type: string, format: email, example: "anthony.dependent@example.com" }
             example:
               firstName: "Anthony"
-              lastName: "Danladi"
+              lastName: "Doe"
               dateOfBirth: "2015-04-12"
               phone: "+231770000002"
               email: "anthony.dependent@example.com"
@@ -1115,7 +1060,7 @@ components:
         contactId: "003XX000004TmiRQAS"
         accountId: "001XX000003DHPhQAO"
         firstName: "Anthony"
-        lastName: "Danladi"
+        lastName: "Doe"
         phone: "+231770000002"
 
     ProfileRecord:
@@ -1137,8 +1082,8 @@ components:
         contactId: "003XX000004TmiQQAS"
         accountId: "001XX000003DHPhQAO"
         role: "Sponsor"
-        firstName: "Kim"
-        lastName: "Danladi"
+        firstName: "John"
+        lastName: "Doe"
 
     SubscriptionStatus:
       description: >-
