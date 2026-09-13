@@ -2,7 +2,7 @@ openapi: 3.1.0
 
 info:
   title: CareRoute Auth & Data API
-  version: "2026.09.01"
+  version: "2026.09.13"
   description: |
     Backend API for the **CareRoute React Native app**. The RN app never calls
     Salesforce directly — every read and write goes through this Express/TypeScript
@@ -39,11 +39,19 @@ info:
       is wired up end-to-end, but no payment/wallet-funding flow exists elsewhere in
       the system yet to move an Account out of that state. Don't build RN UI that
       assumes any other status is reachable today.
-    - **Medical record access for Doctor/Nurse roles is implemented but untestable.**
-      `GET /medical-record` accepts calls from any role with a valid `CallerIdentity`,
-      including provider roles, but there is currently no provider registration flow
-      to actually mint a Doctor/Nurse-role account — so that code path has not been
-      exercised end-to-end.
+    - **Medical record access for Doctor/Nurse roles is now reachable, and
+      strictly scoped per patient.** `POST /provider/claim` mints a Firebase
+      account for a pre-vetted Doctor/Nurse; `GET /me` and `GET /medical-record`
+      gate on `contactId` alone (not `contactId`+`accountId`, which providers
+      never have — see `CallerIdentity`), so a claimed provider's token is no
+      longer rejected before Salesforce's own logic runs. Once past that,
+      `MedicalRecordEndpoint`'s own authorization is what actually matters: a
+      Doctor/Nurse is only authorized for a specific patient if a matching
+      `Visit_Record__c` already links that patient to that provider
+      (`Attending_Provider__c = ctx.contactId`) — there's no self-serve way to
+      create that link through this API, so someone has to create the Visit
+      Record directly in Salesforce first. Verified end-to-end against the
+      sandbox org.
     - **Wallet balance is Sponsor-role only.** `GET /wallet/balance` returns `403`
       for any caller whose role isn't Sponsor (e.g. a claimed dependent), since
       dependents don't hold their own wallet.
@@ -79,8 +87,16 @@ tags:
       Sponsors register dependents by phone number; each dependent later claims
       their own profile under a SEPARATE Firebase identity (their own phone, their
       own OTP + ID token) — never the sponsor's.
+  - name: Providers
+    description: >-
+      Doctors/Nurses claim a pre-vetted profile under a SEPARATE Firebase
+      identity, analogous to Dependents — except there is no self-serve
+      registration endpoint here at all; the underlying Contact and
+      Care_Team_Member__c must already exist and be vetted in Salesforce.
   - name: My Profile
     description: The caller's own Salesforce profile.
+  - name: Wallet Top-Up (Flutterwave)
+    description: Initiates a real Flutterwave payment for a wallet top-up. Sponsor-role only.
   - name: Account Data (Tier 1)
     description: Read-only account data proxied to Salesforce, gated on the caller's CallerIdentity claims.
   - name: Health Checks
@@ -676,6 +692,153 @@ paths:
                 error: "Claim failed"
                 detail: "INTERNAL_SERVER_ERROR"
 
+  /provider/claim:
+    post:
+      tags: [Providers]
+      operationId: claimProvider
+      summary: Claim a pre-vetted provider (Doctor/Nurse) profile as its own Firebase identity
+      description: >-
+        ⚠️ SEPARATE IDENTITY, and unlike dependents there is no self-serve
+        registration endpoint for providers in this API. A Doctor or Nurse's
+        Contact + `Care_Team_Member__c` record must already exist in Salesforce
+        — created directly by an administrator, not via any endpoint here — and
+        that `Care_Team_Member__c` must have `Vetting_Status__c = 'Vetted'`
+        before this call can succeed.
+
+        Before calling this, the provider must sign in as THEMSELVES:
+        `POST /otp/request` → `POST /otp/verify` → the client-side
+        custom-token-for-ID-token exchange, using their own phone number (the
+        one their pre-created Contact record has on file). The resulting ID
+        token is what must be presented as the Bearer token here.
+
+        On success, this links the verified Firebase uid to the matching
+        Salesforce Contact, sets the given `password` as this account's
+        credential, and attaches `contactId`, `careTeamMemberId`, and `role`
+        (`"Doctor"` or `"Nurse"`) as Firebase custom claims — after this, the
+        provider can `POST /login` with their phone + password like anyone
+        else. Calling this again for an already-claimed provider is idempotent:
+        it returns `200` with `wasExisting: true` and the same identifiers,
+        rather than an error.
+
+        ⚠️ **No `accountId` claim is ever set for providers** (see
+        `ProviderClaimResponse` in `ProviderClaimEndpoint` — providers have no
+        Account relationship). `GET /me` and `GET /medical-record` are
+        `contactId`-only and work fine for a claimed provider; the
+        Account-scoped endpoints — `GET /subscription/status`,
+        `GET /wallet/balance`, `POST /wallet/topup` — still require
+        `accountId` too and will correctly reject a provider's token with
+        `403 Registration incomplete`, since none of those concepts apply to a
+        provider anyway.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [password]
+              properties:
+                password:
+                  type: string
+                  minLength: 8
+                  example: "ProviderPass456!"
+            example:
+              password: "ProviderPass456!"
+      responses:
+        "200":
+          description: >-
+            Provider record claimed and linked to this Firebase account (or
+            already claimed previously — see `wasExisting`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderClaimResult"
+              examples:
+                firstClaim:
+                  summary: First-time claim
+                  value:
+                    contactId: "003XX000004TmiSQAS"
+                    careTeamMemberId: "a0CXX000004TmiSQAS"
+                    role: "Doctor"
+                    wasExisting: false
+                alreadyClaimed:
+                  summary: Re-claim of an already-linked provider (idempotent)
+                  value:
+                    contactId: "003XX000004TmiSQAS"
+                    careTeamMemberId: "a0CXX000004TmiSQAS"
+                    role: "Doctor"
+                    wasExisting: true
+        "400":
+          description: Password missing/too short, or the token has no verified phone number.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                noPhone:
+                  value: { error: "No verified phone number on this account" }
+                badPassword:
+                  value: { error: "password is required and must be at least 8 characters" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: >-
+            A matching provider record was found for this phone number, but its
+            `Care_Team_Member__c.Vetting_Status__c` isn't `'Vetted'` yet —
+            passthrough from Salesforce.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorWithDetail"
+              example:
+                error: "Claim failed"
+                detail: "{\"error\":\"Your registration is still under review. You will be notified once your account is approved.\"}"
+        "404":
+          description: >-
+            No unclaimed provider record exists in Salesforce for this phone
+            number — an administrator needs to create it directly in Salesforce
+            first; there is no API endpoint for that step.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorWithDetail"
+              example:
+                error: "Claim failed"
+                detail: "{\"error\":\"No provider registration found for this phone number. Contact your administrator if you believe this is an error.\"}"
+        "500":
+          description: >-
+            Could not reach Salesforce at all, or the claim succeeded on the
+            Salesforce side but the local password write failed.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/Error"
+                  - $ref: "#/components/schemas/PartialSuccessError"
+              examples:
+                sfError:
+                  summary: Could not reach Salesforce at all
+                  value: { error: "Internal error contacting Salesforce" }
+                passwordWriteFailed:
+                  summary: Salesforce link succeeded but the password could not be stored
+                  value:
+                    error: "Profile linked but password could not be set — please try again"
+                    contactId: "003XX000004TmiSQAS"
+        "502":
+          description: >-
+            The Salesforce Apex REST call returned an unexpected non-2xx,
+            non-403, non-404 response — e.g. the provider's Contact record
+            exists but has no associated `Care_Team_Member__c` (a data-integrity
+            gap surfaced by Salesforce as a 500, collapsed here to 502).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorWithDetail"
+              example:
+                error: "Claim failed"
+                detail: "{\"error\":\"Provider record is incomplete. Please contact support.\"}"
+
   /me:
     get:
       tags: [My Profile]
@@ -683,12 +846,15 @@ paths:
       summary: Get the caller's own profile
       description: >-
         Returns the caller's own Salesforce profile (Contact/Account details) —
-        works for both Sponsor and Dependent (Patient) roles, whichever identity's
-        ID token is presented.
+        works for Sponsor, Dependent (Patient), and Doctor/Nurse (provider)
+        roles alike, whichever identity's ID token is presented.
 
-        Requires an ID token carrying `contactId`/`accountId` claims (see
-        `CallerIdentity`), i.e. a completed `POST /register` or
-        `POST /dependent/claim`.
+        Requires an ID token carrying a `contactId` claim (see
+        `CallerIdentity`) — deliberately NOT `accountId` too, since
+        `MyProfileEndpoint` queries by `contactId` alone and returns
+        `accountId: null` gracefully for providers, who never have one. A
+        completed `POST /register`, `POST /dependent/claim`, or
+        `POST /provider/claim` all satisfy this.
       security:
         - bearerAuth: []
       responses:
@@ -827,6 +993,122 @@ paths:
                 error: "Failed to fetch wallet balance"
                 detail: "INTERNAL_SERVER_ERROR"
 
+  /wallet/topup:
+    post:
+      tags: [Wallet Top-Up (Flutterwave)]
+      operationId: initiateWalletTopup
+      summary: Initiate a Flutterwave wallet top-up
+      description: >-
+        Single endpoint that starts a wallet top-up end to end: creates a
+        Pending `Wallet_Transaction__c` in Salesforce, then immediately
+        initializes the actual payment with Flutterwave's API using the SAME
+        reference Salesforce just generated as `tx_ref` — so
+        `FlutterwaveWebhookResource` can later match Flutterwave's
+        payment-succeeded callback back to this exact transaction. The RN app
+        gets back a single response with everything needed to launch checkout;
+        no separate manual Flutterwave call is required.
+
+        Requires an ID token carrying `contactId`/`accountId` claims (i.e. a
+        completed `POST /register`) — Salesforce's own role check additionally
+        requires the `Sponsor` role specifically, since dependents don't hold a
+        wallet. Note this Cloud Function does not itself pre-check
+        `contactId`/`accountId` presence the way sibling endpoints do — an
+        unregistered caller's token is still forwarded to Salesforce, where
+        Salesforce's own role check rejects it instead.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [amount]
+              properties:
+                amount:
+                  type: number
+                  description: Positive top-up amount, in the wallet's local currency.
+                  example: 2500
+            example:
+              amount: 2500
+      responses:
+        "200":
+          description: Transaction created in Salesforce and payment initialized with Flutterwave.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TopUpResult"
+              example:
+                transactionId: "a0BXX000004TmiRQAS"
+                gatewayReference: "TOPUP-001XX000003DHPhQAO-1794355200000"
+                amount: 2500
+                checkoutLink: "https://checkout.flutterwave.com/v3/hosted/pay/abcd1234"
+        "400":
+          description: "`amount` missing, non-numeric, or not a positive number."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: "A valid positive amount is required"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: >-
+            Passthrough from Salesforce — no `CareRoute_Wallet__c` exists for
+            this caller's Account.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorWithDetail"
+              example:
+                error: "Could not create top-up transaction"
+                detail: "{\"error\":\"No wallet found for this account\"}"
+        "500":
+          description: >-
+            Could not reach Salesforce at all, or the Salesforce transaction was
+            created but the subsequent Flutterwave call itself failed to
+            complete (network-level, not a Flutterwave-returned error).
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/Error"
+                  - $ref: "#/components/schemas/TopUpPartialFailure"
+              examples:
+                sfError:
+                  summary: Could not reach Salesforce at all
+                  value: { error: "Internal error contacting Salesforce" }
+                flutterwaveError:
+                  summary: Salesforce transaction created, but the Flutterwave call itself errored
+                  value:
+                    error: "Internal error contacting Flutterwave"
+                    transactionId: "a0BXX000004TmiRQAS"
+        "502":
+          description: >-
+            Either the Salesforce Apex REST call returned an unexpected non-2xx,
+            non-404 response — e.g. a non-Sponsor caller gets
+            `"This action requires role: Sponsor"` from
+            `CareRouteApiUtils.requireRole()` — or Salesforce succeeded but
+            Flutterwave rejected the payment initialization itself.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/ErrorWithDetail"
+                  - $ref: "#/components/schemas/TopUpPartialFailure"
+              examples:
+                salesforceRejected:
+                  summary: Salesforce Apex REST call failed, e.g. caller isn't a Sponsor
+                  value:
+                    error: "Could not create top-up transaction"
+                    detail: "{\"error\":\"This action requires role: Sponsor\"}"
+                flutterwaveRejected:
+                  summary: Salesforce transaction created, but Flutterwave itself rejected the payment
+                  value:
+                    error: "Payment could not be initiated"
+                    transactionId: "a0BXX000004TmiRQAS"
+
   /medical-record:
     get:
       tags: [Account Data (Tier 1)]
@@ -834,20 +1116,29 @@ paths:
       summary: Get a patient's medical record
       description: >-
         Returns the medical record for the patient identified by the required
-        `patientContactId` query parameter.
+        `patientContactId` query parameter. Authorization (and how much detail
+        comes back) depends on the caller's role:
 
-        `patientContactId` must be either: the caller's OWN contactId (if the
-        caller is a Patient/Dependent), or a DEPENDENT's contactId under the
-        caller's own Account (if the caller is a Sponsor). Sponsor-role responses
-        omit the `knownConditions` and `knownAllergies` fields that a
-        Patient/Dependent viewing their own record would see.
+        - **Patient/Dependent**: `patientContactId` must be their OWN contactId.
+          Full detail, including `knownConditions`/`knownAllergies`.
+        - **Sponsor**: `patientContactId` must be a DEPENDENT's contactId under
+          the caller's own Account. Summary only — `knownConditions` and
+          `knownAllergies` are omitted — and further gated by that specific
+          `Medical_Record__c`'s `Payer_Read_Only_Access_Granted__c` flag, which
+          can revoke a Sponsor's access to one patient's record independent of
+          the Account relationship (`403 Payer access has been revoked for this
+          record` if so).
+        - **Doctor/Nurse**: `patientContactId` can be ANY patient this specific
+          provider has an on-file `Visit_Record__c` for
+          (`Attending_Provider__c` = their own contactId) — not limited to
+          patients under any particular Account. Full detail, same as a
+          Patient viewing their own record. There's no endpoint in this API
+          for creating that Visit Record relationship; it has to already exist
+          in Salesforce.
 
-        **Known limitation:** Doctor/Nurse-role access to this endpoint is
-        implemented server-side but currently untestable — there is no provider
-        registration flow yet to mint a Doctor/Nurse-role `CallerIdentity`.
-
-        Requires an ID token carrying `contactId`/`accountId` claims (see
-        `CallerIdentity`).
+        Requires an ID token carrying a `contactId` claim (see
+        `CallerIdentity`) — deliberately NOT `accountId` too, since a
+        provider's role-specific authorization above never uses it.
       parameters:
         - name: patientContactId
           in: query
@@ -865,6 +1156,23 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/MedicalRecord"
+              examples:
+                fullAccess:
+                  summary: Patient, Dependent, or Doctor/Nurse view
+                  value:
+                    recordCreatedDate: "2025-03-10"
+                    totalVisitsOnRecord: 4
+                    lastVisitDate: "2026-09-12"
+                    knownConditions: "Asthma"
+                    knownAllergies: "Penicillin"
+                sponsorSummary:
+                  summary: Sponsor view — clinical detail omitted
+                  value:
+                    recordCreatedDate: "2025-03-10"
+                    totalVisitsOnRecord: 4
+                    lastVisitDate: "2026-09-12"
+                    knownConditions: null
+                    knownAllergies: null
         "400":
           description: "`patientContactId` query parameter was missing."
           content:
@@ -877,9 +1185,9 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           description: >-
-            The caller's token is missing `contactId`/`accountId` claims, OR
-            `patientContactId` is not the caller's own contactId and not a
-            dependent's contactId under the caller's Account.
+            The caller's token is missing a `contactId` claim, OR the caller
+            isn't authorized for this specific `patientContactId` per the
+            role-based rules above.
           content:
             application/json:
               schema:
@@ -887,9 +1195,15 @@ paths:
               examples:
                 registrationIncomplete:
                   value: { error: "Registration incomplete" }
-                notOwned:
-                  summary: patientContactId isn't the caller's own or a dependent's
-                  value: { error: "Failed to fetch medical record", detail: "FORBIDDEN" }
+                notAuthorized:
+                  summary: >-
+                    Wrong relationship for the role (not the caller's own
+                    contactId, not their dependent, or — for a provider — no
+                    matching Visit_Record__c with this patient)
+                  value: { error: "Failed to fetch medical record", detail: "{\"error\":\"Not authorized to view this medical record\"}" }
+                payerAccessRevoked:
+                  summary: Sponsor's access to this specific patient's record was explicitly revoked
+                  value: { error: "Failed to fetch medical record", detail: "{\"error\":\"Payer access has been revoked for this record\"}" }
         "404":
           description: >-
             No medical record exists yet for that Contact — expected until one is
@@ -1000,11 +1314,15 @@ components:
         Not a request/response body — this documents the Firebase custom claims
         embedded in the JWT payload of a caller's ID token, which the server reads
         via `admin.auth().verifyIdToken()` and checks on most protected endpoints.
-        These claims are set once by `POST /register` (Sponsor) or
-        `POST /dependent/claim` (Dependent), and are absent on any ID token minted
-        before that completes. An endpoint that requires them returns
-        `403 { "error": "Registration incomplete" }` when `contactId` or
-        `accountId` is missing.
+        These claims are set once by `POST /register` (Sponsor),
+        `POST /dependent/claim` (Dependent), or `POST /provider/claim`
+        (Doctor/Nurse), and are absent on any ID token minted before that
+        completes. Most endpoints require `contactId` alone; a few
+        (`GET /subscription/status`, `GET /wallet/balance`, `POST /wallet/topup`)
+        additionally require `accountId`, since those are Account/Sponsor-scoped
+        concepts a provider has no use for. Either kind of gate returns
+        `403 { "error": "Registration incomplete" }` when the claim(s) it
+        checks are missing.
       type: object
       properties:
         contactId:
@@ -1012,15 +1330,23 @@ components:
           description: Salesforce Contact Id for this caller.
         accountId:
           type: string
-          description: Salesforce Account Id this caller's Contact belongs to.
+          description: >-
+            Salesforce Account Id this caller's Contact belongs to. NEVER
+            present when `role` is `"Doctor"`/`"Nurse"` — providers have no
+            Account relationship (see `POST /provider/claim`). `GET /me` and
+            `GET /medical-record` are deliberately `contactId`-only for this
+            reason, since neither actually needs `accountId` on the Salesforce
+            side; `GET /subscription/status`, `GET /wallet/balance`, and
+            `POST /wallet/topup` still require it, so a provider's token is
+            correctly rejected by those.
         role:
           type: string
           description: >-
             The caller's role as assigned by Salesforce at registration/claim
-            time (observed values include "Sponsor" and "Dependent"; Doctor/Nurse
-            roles are supported server-side but not currently mintable — see the
-            top-level known-limitations note).
-          examples: ["Sponsor", "Dependent"]
+            time. Observed values: `"Sponsor"` (via `POST /register`),
+            `"Dependent"` (via `POST /dependent/claim`), and `"Doctor"`/`"Nurse"`
+            (via `POST /provider/claim`).
+          examples: ["Sponsor", "Dependent", "Doctor", "Nurse"]
         phone_number:
           type: string
           description: Standard Firebase Auth claim — the verified E.164 phone number, when present.
@@ -1043,6 +1369,65 @@ components:
         wasExisting:
           type: boolean
           description: Whether this Contact already existed in Salesforce prior to this call.
+
+    ProviderClaimResult:
+      description: >-
+        Success response for `POST /provider/claim`. Deliberately has NO
+        `accountId` field, unlike `RegistrationResult` — providers have no
+        Salesforce Account relationship (see `ProviderClaimEndpoint`).
+      type: object
+      required: [contactId, careTeamMemberId, role, wasExisting]
+      properties:
+        contactId: { type: string }
+        careTeamMemberId:
+          type: string
+          description: Salesforce Id of the provider's Care_Team_Member__c record.
+        role:
+          type: string
+          examples: ["Doctor", "Nurse"]
+        wasExisting:
+          type: boolean
+          description: >-
+            True if this provider had already been claimed previously (this
+            call is idempotent, not an error, in that case).
+
+    TopUpResult:
+      description: >-
+        Success response for `POST /wallet/topup` — combines the Salesforce
+        Pending transaction with the Flutterwave checkout link in one payload.
+      type: object
+      required: [transactionId, gatewayReference, amount, checkoutLink]
+      properties:
+        transactionId:
+          type: string
+          description: Salesforce Id of the new Wallet_Transaction__c record.
+        gatewayReference:
+          type: string
+          description: >-
+            Also used as Flutterwave's `tx_ref` — this is what
+            FlutterwaveWebhookResource matches the later payment callback
+            against.
+        amount:
+          type: number
+        checkoutLink:
+          type: string
+          format: uri
+          description: Flutterwave-hosted checkout URL to open/redirect the user to.
+
+    TopUpPartialFailure:
+      description: >-
+        Returned when the Salesforce Pending transaction was already created
+        but a later step (initializing the real payment with Flutterwave)
+        failed or errored — the transaction is not silently orphaned; it stays
+        Pending until reconciled or retried.
+      allOf:
+        - $ref: "#/components/schemas/Error"
+        - type: object
+          required: [transactionId]
+          properties:
+            transactionId:
+              type: string
+              description: The Salesforce Wallet_Transaction__c Id created before the failure.
 
     DependentRecord:
       description: >-
@@ -1113,30 +1498,32 @@ components:
 
     MedicalRecord:
       description: >-
-        Response shape for `GET /medical-record`, passed through from the
-        Salesforce `medical-record` Apex REST endpoint as-is. The exact field
-        list is defined by that Apex controller (not present in this repo).
-        `knownConditions` and `knownAllergies` are known to be omitted from
-        Sponsor-role responses (see this endpoint's description) — other fields
-        below are illustrative; confirm against the Apex source.
+        Response shape for `GET /medical-record` — matches
+        `MedicalRecordEndpoint.MedicalRecordResponse` exactly.
+        `knownConditions`/`knownAllergies` are free-text strings (not arrays),
+        and are `null` for Sponsor-role callers (`isFullAccess = false` in
+        Apex) — Patient/Dependent and Doctor/Nurse callers get both fields
+        populated.
       type: object
-      additionalProperties: true
+      required: [recordCreatedDate, totalVisitsOnRecord, lastVisitDate]
       properties:
-        patientContactId: { type: string }
+        recordCreatedDate: { type: string, format: date }
+        totalVisitsOnRecord: { type: integer }
+        lastVisitDate: { type: string, format: date, nullable: true }
         knownConditions:
-          type: array
-          items: { type: string }
+          type: string
           nullable: true
-          description: Omitted/absent for Sponsor-role callers.
+          description: Free-text. Null/absent for Sponsor-role callers.
         knownAllergies:
-          type: array
-          items: { type: string }
+          type: string
           nullable: true
-          description: Omitted/absent for Sponsor-role callers.
+          description: Free-text. Null/absent for Sponsor-role callers.
       example:
-        patientContactId: "003XX000004TmiRQAS"
-        knownConditions: ["Asthma"]
-        knownAllergies: ["Penicillin"]
+        recordCreatedDate: "2025-03-10"
+        totalVisitsOnRecord: 4
+        lastVisitDate: "2026-09-12"
+        knownConditions: "Asthma"
+        knownAllergies: "Penicillin"
 
   responses:
     Unauthorized:
