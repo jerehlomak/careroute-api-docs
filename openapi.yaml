@@ -2,7 +2,7 @@ openapi: 3.1.0
 
 info:
   title: CareRoute Auth & Data API
-  version: "2026.09.13"
+  version: "2026.09.30"
   description: |
     Backend API for the **CareRoute React Native app**. The RN app never calls
     Salesforce directly — every read and write goes through this Express/TypeScript
@@ -35,23 +35,22 @@ info:
 
     ## Known current limitations (affect API consumers directly)
 
-    - **Subscription status always shows `"Pending"`.** `GET /subscription/status`
-      is wired up end-to-end, but no payment/wallet-funding flow exists elsewhere in
-      the system yet to move an Account out of that state. Don't build RN UI that
-      assumes any other status is reachable today.
-    - **Medical record access for Doctor/Nurse roles is now reachable, and
-      strictly scoped per patient.** `POST /provider/claim` mints a Firebase
-      account for a pre-vetted Doctor/Nurse; `GET /me` and `GET /medical-record`
-      gate on `contactId` alone (not `contactId`+`accountId`, which providers
-      never have — see `CallerIdentity`), so a claimed provider's token is no
-      longer rejected before Salesforce's own logic runs. Once past that,
-      `MedicalRecordEndpoint`'s own authorization is what actually matters: a
-      Doctor/Nurse is only authorized for a specific patient if a matching
-      `Visit_Record__c` already links that patient to that provider
-      (`Attending_Provider__c = ctx.contactId`) — there's no self-serve way to
-      create that link through this API, so someone has to create the Visit
-      Record directly in Salesforce first. Verified end-to-end against the
-      sandbox org.
+    - **Subscription status reflects the account's current subscription.**
+      `GET /subscription/status` returns `status` (`Active`, `Pending`,
+      `Paused/ Suspended`, `Expired` or `Cancelled`), `planType`,
+      `visitsRemaining` and `renewalDate`. A newly registered sponsor starts as
+      `Pending` until the subscription is activated. To decide whether the app
+      should offer "request care", use `GET /care-requests/eligibility` and its
+      `reasonCode`; do not branch on the raw `status` string.
+    - **Medical record access for Doctor/Nurse roles is reachable, and strictly
+      scoped per patient.** `POST /provider/claim` creates a Firebase account
+      for a pre-vetted Doctor/Nurse; `GET /me` and `GET /medical-record` gate on
+      `contactId` alone (not `contactId`+`accountId`, which providers never have
+      — see `CallerIdentity`), so a claimed provider's token is not rejected
+      before the server's own authorization runs. That authorization decides
+      per patient: a Doctor/Nurse can view a patient's record only if that
+      patient has an existing visit attended by that provider. There is no
+      endpoint in this API to create that link; it must already exist.
     - **Wallet balance is Sponsor-role only.** `GET /wallet/balance` returns `403`
       for any caller whose role isn't Sponsor (e.g. a claimed dependent), since
       dependents don't hold their own wallet.
@@ -91,12 +90,18 @@ tags:
     description: >-
       Doctors/Nurses claim a pre-vetted profile under a SEPARATE Firebase
       identity, analogous to Dependents — except there is no self-serve
-      registration endpoint here at all; the underlying Contact and
-      Care_Team_Member__c must already exist and be vetted in Salesforce.
+      registration endpoint here at all; the underlying provider profile
+      must already exist and be vetted.
   - name: My Profile
     description: The caller's own Salesforce profile.
-  - name: Wallet Top-Up (Flutterwave)
-    description: Initiates a real Flutterwave payment for a wallet top-up. Sponsor-role only.
+  - name: Push Notifications
+    description: >-
+      Registering a device token is a normal call any signed-in identity can
+      make. Sending a push notification is not part of the mobile API surface.
+  - name: Wallet
+    description: Wallet balance, top-ups and transaction history. Sponsor-role only.
+  - name: Care Requests
+    description: Care request pre-checks and (later) creation.
   - name: Account Data (Tier 1)
     description: Read-only account data proxied to Salesforce, gated on the caller's CallerIdentity claims.
   - name: Health Checks
@@ -129,13 +134,10 @@ paths:
       operationId: getSalesforceHealth
       summary: Salesforce connectivity check
       description: >-
-        Confirms the Salesforce JWT Bearer flow works end-to-end: exchanges the
-        integration user's signed JWT for a Salesforce access token and calls
-        Salesforce's `/limits` endpoint. No Authorization header is required on
-        this endpoint itself, but the server's own Salesforce credentials
-        (SF_JWT_PRIVATE_KEY / SF_CONSUMER_KEY / SF_INTEGRATION_USERNAME, or the
-        equivalent Secret Manager secrets) must be valid for it to succeed. Useful
-        as a first diagnostic step whenever a 502 shows up elsewhere.
+        Confirms the server can reach Salesforce end to end: it authenticates to
+        Salesforce and calls Salesforce's `/limits` endpoint. No Authorization
+        header is required. Useful as a first diagnostic step whenever a 502
+        shows up elsewhere.
       security: []
       responses:
         "200":
@@ -146,7 +148,7 @@ paths:
                 $ref: "#/components/schemas/SalesforceHealthStatus"
               example:
                 status: connected
-                instanceUrl: "https://careroute--sandbox.sandbox.my.salesforce.com"
+                instanceUrl: "https://instance.example.com"
                 sampleLimit: 15000
         "500":
           description: The JWT Bearer exchange or the Salesforce `/limits` call failed.
@@ -393,8 +395,8 @@ paths:
       operationId: registerSponsor
       summary: Register the caller as a Sponsor
       description: >-
-        Registers the caller as a Sponsor in Salesforce via the JWT Bearer
-        integration user, then — only if that succeeds — sets the account's
+        Registers the caller as a Sponsor in Salesforce, then — only if that
+        succeeds — sets the account's
         password locally and attaches `contactId`, `accountId`, and `role` as
         Firebase custom claims (see `CallerIdentity`) on the user. `firstName`,
         `country`, and `password` are required; `phone` in the body is only used
@@ -469,7 +471,7 @@ paths:
           content:
             application/json:
               schema:
-                oneOf:
+                anyOf:
                   - $ref: "#/components/schemas/Error"
                   - $ref: "#/components/schemas/PartialSuccessError"
               examples:
@@ -486,10 +488,135 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ErrorWithDetail"
+                $ref: "#/components/schemas/Error"
               example:
                 error: "Registration failed on Salesforce side"
-                detail: "{\"message\":\"DUPLICATE_VALUE\"}"
+
+  /care-requests/eligibility:
+    get:
+      tags: [Care Requests]
+      operationId: checkCareRequestEligibility
+      summary: Advisory pre-check for creating a care request
+      description: >-
+        **Advisory, read-only.** Tells the app whether a care request would be
+        allowed for the caller's account right now. **Enforcement is not
+        here**: it stays in the care-request creation rules on the
+        server, which decide at create time.
+        `eligible: true` is not a guarantee (visits are deducted when a visit
+        starts, so several open requests can pass against the same last visit,
+        and state can change before the create).
+
+        Requires an ID token with `contactId` and `accountId` claims and role
+        **Sponsor** or **Patient**; Doctor and Nurse get `403`.
+
+        `reasonCode` is null when eligible and otherwise one of
+        `NO_SUBSCRIPTION`, `SUBSCRIPTION_PENDING`, `SUBSCRIPTION_SUSPENDED`,
+        `SUBSCRIPTION_EXPIRED`, `SUBSCRIPTION_CANCELLED`, `VISITS_EXHAUSTED`,
+        `SUBSCRIPTION_INACTIVE`. Codes only; the app owns the wording. **Never
+        branch on `subscriptionStatus`** (raw Salesforce value such as
+        `Paused/ Suspended`); use `reasonCode`. An Active subscription with no
+        visit allowance set returns `VISITS_EXHAUSTED`.
+
+        The evaluated subscription is the account's newest Active one that still
+        has visits, else its newest Active one, else its newest of any status.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: The advisory result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CareRequestEligibility"
+              examples:
+                eligible:
+                  value: { eligible: true, reasonCode: null, visitsRemaining: 9, subscriptionStatus: "Active" }
+                visitsExhausted:
+                  value: { eligible: false, reasonCode: "VISITS_EXHAUSTED", visitsRemaining: 0, subscriptionStatus: "Active" }
+                pending:
+                  value: { eligible: false, reasonCode: "SUBSCRIPTION_PENDING", visitsRemaining: 0, subscriptionStatus: "Pending" }
+                noSubscription:
+                  value: { eligible: false, reasonCode: "NO_SUBSCRIPTION", visitsRemaining: null, subscriptionStatus: null }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: Token is missing `contactId`/`accountId` claims, or the caller is not a Sponsor or Patient.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                registrationIncomplete:
+                  value: { error: "Registration incomplete" }
+                wrongRole:
+                  value: { error: "This action requires the Sponsor or Patient role" }
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "502":
+          description: Salesforce returned an unexpected error. The upstream body is not forwarded.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example: { error: "Failed to fetch eligibility" }
+
+  /dependents:
+    get:
+      tags: [Dependents]
+      operationId: listDependents
+      summary: List the dependents on the caller's Sponsor account
+      description: >-
+        Returns the dependents (members of the account with the Patient role) on the
+        calling Sponsor's account, sorted by last name then first name. The caller is
+        never included. Read-only. Maximum 200 items, no pagination.
+
+        **Sponsor role only** (any other role gets `403`). Requires an ID token
+        carrying `contactId`/`accountId` claims.
+
+        `claimed` is true when the dependent has signed in and linked their own
+        login; no login identifier is ever returned. People with no role set on
+        the account do not appear. `birthdate` and
+        `phone` are deliberately not returned and can be added if the screen
+        needs them.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: The dependent list (`items` is empty when there are none).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DependentList"
+              examples:
+                populated:
+                  value:
+                    items:
+                      - { id: "003XX000004EXMPL01", firstName: "Alex", lastName: "Sample", claimed: false, appAccountCreated: false }
+                      - { id: "003XX000004EXMPL02", firstName: "Sam", lastName: "Sample", claimed: true, appAccountCreated: true }
+                empty:
+                  value: { items: [] }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: Token is missing `contactId`/`accountId` claims, or the caller is not a Sponsor.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                registrationIncomplete:
+                  value: { error: "Registration incomplete" }
+                notSponsor:
+                  value: { error: "This action requires the Sponsor role" }
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "502":
+          description: Salesforce returned an unexpected error. The upstream body is not forwarded.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example: { error: "Failed to fetch dependents" }
 
   /dependent/register:
     post:
@@ -564,16 +691,15 @@ paths:
                 registrationIncomplete:
                   value: { error: "Registration incomplete" }
                 sfForbidden:
-                  value: { error: "Failed to register dependent", detail: "Forbidden for this role" }
+                  value: { error: "Failed to register dependent" }
         "409":
           description: A dependent already exists for that phone number under this Account.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ErrorWithDetail"
+                $ref: "#/components/schemas/Error"
               example:
                 error: "Failed to register dependent"
-                detail: "DUPLICATE_DEPENDENT_PHONE"
         "500":
           $ref: "#/components/responses/InternalError"
         "502":
@@ -581,10 +707,9 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ErrorWithDetail"
+                $ref: "#/components/schemas/Error"
               example:
                 error: "Failed to register dependent"
-                detail: "INTERNAL_SERVER_ERROR"
 
   /dependent/claim:
     post:
@@ -659,10 +784,9 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ErrorWithDetail"
+                $ref: "#/components/schemas/Error"
               example:
                 error: "Claim failed"
-                detail: "NOT_FOUND"
         "500":
           description: >-
             Could not reach Salesforce at all, or the claim succeeded on the
@@ -670,7 +794,7 @@ paths:
           content:
             application/json:
               schema:
-                oneOf:
+                anyOf:
                   - $ref: "#/components/schemas/Error"
                   - $ref: "#/components/schemas/PartialSuccessError"
               examples:
@@ -687,10 +811,75 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ErrorWithDetail"
+                $ref: "#/components/schemas/Error"
               example:
                 error: "Claim failed"
-                detail: "INTERNAL_SERVER_ERROR"
+
+  /provider/me:
+    get:
+      tags: [Providers]
+      operationId: getMyProviderProfile
+      summary: The calling Doctor's or Nurse's own profile summary
+      description: >-
+        The caller's own provider profile summary. Read-only. Requires a
+        **provider** ID token (role `Doctor` or `Nurse`). Provider tokens carry
+        `contactId`, `careTeamMemberId` and `role` and no `accountId`; none is
+        needed. Sponsor and Patient tokens get `403`.
+
+        Returns `200` for every `vettingStatus`; the app must gate on it.
+        `Pending` = awaiting admin approval ("account under review");
+        `Vetted` = approved (only these are dispatched to); `Suspended` =
+        admin-set, nothing automatic sets it ("account suspended"); anything
+        else or null = neutral blocked screen.
+
+        `rating`, `totalCompletedVisits`, `totalDispatches` and
+        `averageResponseTimeMins` are **null today** (nothing populates them
+        yet); treat null as "no data", not 0. `availabilityStatus` is null if
+        never set. The payout account and licence number are deliberately not
+        returned.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: The provider profile.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderProfile"
+              examples:
+                vetted:
+                  value: { providerType: "Doctor", specialisation: "Pro", vettingStatus: "Vetted", onDuty: false, availabilityStatus: null, rating: null, totalCompletedVisits: null, totalDispatches: null, averageResponseTimeMins: null }
+                pending:
+                  value: { providerType: "Nurse", specialisation: "Midwifery", vettingStatus: "Pending", onDuty: false, availabilityStatus: null, rating: null, totalCompletedVisits: null, totalDispatches: null, averageResponseTimeMins: null }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: Token is missing `contactId`, or the caller is not a Doctor or Nurse.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                notProvider:
+                  value: { error: "This action requires the Doctor or Nurse role" }
+                registrationIncomplete:
+                  value: { error: "Registration incomplete" }
+        "404":
+          description: No provider profile exists for this login.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example: { error: "Provider profile not found" }
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "502":
+          description: Salesforce returned an unexpected error. The upstream body is not forwarded.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example: { error: "Failed to fetch provider profile" }
 
   /provider/claim:
     post:
@@ -700,10 +889,9 @@ paths:
       description: >-
         ⚠️ SEPARATE IDENTITY, and unlike dependents there is no self-serve
         registration endpoint for providers in this API. A Doctor or Nurse's
-        Contact + `Care_Team_Member__c` record must already exist in Salesforce
-        — created directly by an administrator, not via any endpoint here — and
-        that `Care_Team_Member__c` must have `Vetting_Status__c = 'Vetted'`
-        before this call can succeed.
+        profile must already exist — created directly by an administrator, not
+        via any endpoint here — and must be vetted before this call can
+        succeed.
 
         Before calling this, the provider must sign in as THEMSELVES:
         `POST /otp/request` → `POST /otp/verify` → the client-side
@@ -720,8 +908,7 @@ paths:
         it returns `200` with `wasExisting: true` and the same identifiers,
         rather than an error.
 
-        ⚠️ **No `accountId` claim is ever set for providers** (see
-        `ProviderClaimResponse` in `ProviderClaimEndpoint` — providers have no
+        ⚠️ **No `accountId` claim is ever set for providers** (providers have no
         Account relationship). `GET /me` and `GET /medical-record` are
         `contactId`-only and work fine for a claimed provider; the
         Account-scoped endpoints — `GET /subscription/status`,
@@ -784,16 +971,15 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           description: >-
-            A matching provider record was found for this phone number, but its
-            `Care_Team_Member__c.Vetting_Status__c` isn't `'Vetted'` yet —
+            A matching provider record was found for this phone number, but it
+            isn't vetted yet —
             passthrough from Salesforce.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ErrorWithDetail"
+                $ref: "#/components/schemas/Error"
               example:
                 error: "Claim failed"
-                detail: "{\"error\":\"Your registration is still under review. You will be notified once your account is approved.\"}"
         "404":
           description: >-
             No unclaimed provider record exists in Salesforce for this phone
@@ -802,10 +988,9 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ErrorWithDetail"
+                $ref: "#/components/schemas/Error"
               example:
                 error: "Claim failed"
-                detail: "{\"error\":\"No provider registration found for this phone number. Contact your administrator if you believe this is an error.\"}"
         "500":
           description: >-
             Could not reach Salesforce at all, or the claim succeeded on the
@@ -813,7 +998,7 @@ paths:
           content:
             application/json:
               schema:
-                oneOf:
+                anyOf:
                   - $ref: "#/components/schemas/Error"
                   - $ref: "#/components/schemas/PartialSuccessError"
               examples:
@@ -829,15 +1014,14 @@ paths:
           description: >-
             The Salesforce Apex REST call returned an unexpected non-2xx,
             non-403, non-404 response — e.g. the provider's Contact record
-            exists but has no associated `Care_Team_Member__c` (a data-integrity
+            exists but has no associated provider profile (a data-integrity
             gap surfaced by Salesforce as a 500, collapsed here to 502).
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ErrorWithDetail"
+                $ref: "#/components/schemas/Error"
               example:
                 error: "Claim failed"
-                detail: "{\"error\":\"Provider record is incomplete. Please contact support.\"}"
 
   /me:
     get:
@@ -851,7 +1035,7 @@ paths:
 
         Requires an ID token carrying a `contactId` claim (see
         `CallerIdentity`) — deliberately NOT `accountId` too, since
-        `MyProfileEndpoint` queries by `contactId` alone and returns
+        the profile lookup uses `contactId` alone and returns
         `accountId: null` gracefully for providers, who never have one. A
         completed `POST /register`, `POST /dependent/claim`, or
         `POST /provider/claim` all satisfy this.
@@ -873,10 +1057,9 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ErrorWithDetail"
+                $ref: "#/components/schemas/Error"
               example:
                 error: "Failed to fetch profile"
-                detail: "NOT_FOUND"
         "500":
           $ref: "#/components/responses/InternalError"
         "502":
@@ -884,10 +1067,88 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ErrorWithDetail"
+                $ref: "#/components/schemas/Error"
               example:
                 error: "Failed to fetch profile"
-                detail: "INTERNAL_SERVER_ERROR"
+
+  /device-token:
+    post:
+      tags: [Push Notifications]
+      operationId: registerDeviceToken
+      summary: Register or update this device's push token
+      description: >-
+        Registers/updates the FCM device token for the currently signed-in
+        identity. Works for Sponsor, Dependent, and Provider alike: no
+        `accountId` claim is required. Only one device token is stored per
+        person, so registering a second device replaces the first.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [deviceToken]
+              properties:
+                deviceToken:
+                  type: string
+                  description: FCM registration token for this device.
+                  example: "fcm-test-token-abc123xyz"
+            example:
+              deviceToken: "fcm-test-token-abc123xyz"
+      responses:
+        "200":
+          description: >-
+            Device token saved. Note the Cloud Function always returns this
+            literal body on any Salesforce 2xx — it doesn't forward
+            Salesforce's actual response.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessResponse"
+              example:
+                success: true
+        "400":
+          description: "`deviceToken` missing or not a string."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: "deviceToken is required"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: The token has no `contactId` claim yet.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: "Account not yet linked to a Contact — complete claim/login first"
+        "404":
+          description: >-
+            Passthrough — no Contact found for this caller's `contactId`
+            (shouldn't normally happen if it came from a real claim/register).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: "Could not register device"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "502":
+          description: >-
+            Any other server-side failure while saving the device token.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: "Could not register device"
+
 
   /subscription/status:
     get:
@@ -895,11 +1156,13 @@ paths:
       operationId: getSubscriptionStatus
       summary: Get the caller's Account subscription status
       description: >-
-        Returns the subscription status for the caller's Salesforce Account.
-
-        **Known limitation:** the returned `status` will currently always be
-        `"Pending"`, since no payment/wallet-funding flow exists yet to move an
-        Account out of that state.
+        Returns the current subscription for the caller's account: `status`
+        (`Active`, `Pending`, `Paused/ Suspended`, `Expired` or `Cancelled`),
+        `planType`, `visitsRemaining` and `renewalDate`. A newly registered
+        sponsor starts as `Pending` until the subscription is activated. To
+        decide whether to offer "request care", use
+        `GET /care-requests/eligibility`; do not branch on the raw `status`
+        string.
 
         Requires an ID token carrying `contactId`/`accountId` claims (see
         `CallerIdentity`).
@@ -913,7 +1176,10 @@ paths:
               schema:
                 $ref: "#/components/schemas/SubscriptionStatus"
               example:
-                status: "Pending"
+                status: "Active"
+                planType: "Sponsor ($150)"
+                visitsRemaining: 4
+                renewalDate: "2027-03-04"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -923,10 +1189,9 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ErrorWithDetail"
+                $ref: "#/components/schemas/Error"
               example:
                 error: "Failed to fetch subscription status"
-                detail: "NOT_FOUND"
         "500":
           $ref: "#/components/responses/InternalError"
         "502":
@@ -934,14 +1199,13 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ErrorWithDetail"
+                $ref: "#/components/schemas/Error"
               example:
                 error: "Failed to fetch subscription status"
-                detail: "INTERNAL_SERVER_ERROR"
 
   /wallet/balance:
     get:
-      tags: [Account Data (Tier 1)]
+      tags: [Wallet]
       operationId: getWalletBalance
       summary: Get the caller's Account wallet balance
       description: >-
@@ -963,8 +1227,9 @@ paths:
               schema:
                 $ref: "#/components/schemas/WalletBalance"
               example:
-                balance: 25.5
-                currency: "USD"
+                currentBalance: 25.5
+                lowBalanceThreshold: 5
+                walletStatus: "Active"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -980,7 +1245,7 @@ paths:
                   value: { error: "Registration incomplete" }
                 notEntitled:
                   summary: Caller role (e.g. a claimed dependent) has no wallet
-                  value: { error: "Failed to fetch wallet balance", detail: "FORBIDDEN" }
+                  value: { error: "Failed to fetch wallet balance" }
         "500":
           $ref: "#/components/responses/InternalError"
         "502":
@@ -988,22 +1253,279 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ErrorWithDetail"
+                $ref: "#/components/schemas/Error"
               example:
                 error: "Failed to fetch wallet balance"
-                detail: "INTERNAL_SERVER_ERROR"
+
+  /wallet/transactions:
+    get:
+      tags: [Wallet]
+      operationId: listWalletTransactions
+      summary: List the account's wallet transactions (newest first, cursor-paginated)
+      description: >-
+        Wallet history for the calling Sponsor's account. Read-only.
+        **Sponsor role only** (any other role gets `403`). Requires an ID token
+        carrying `contactId`/`accountId` claims.
+
+        Ordered by `createdAt` descending, ties broken by `id`. `nextCursor` is
+        null on the last page. There is **no default filter**. `amount` and
+        `reference` can be null. Currency and the Email field are never
+        returned; `amount` is the amount stored at initiation.
+
+        **Scope:** wallet ledger rows only, which today means top-ups. Renewal
+        deductions and other payments (extra visits, renewals) are not included.
+        Behaviour is account-level (an account with several wallets returns
+        transactions from all of them). Rows created by other owners are not
+        visible to this endpoint.
+
+        **Status handling:** `Success` = paid; `Failed` = failed; `Pending`
+        under 24 hours old (compute from `createdAt`) = processing; `Pending`
+        over 24 hours old = abandoned (the `Flutterwave Pending Txn Poll` job
+        re-checks Pending rows only between 90 seconds and 24 hours old); any
+        other value (`Completed/Failed`, `Refunded`, `Timeout`) is neutral and
+        must never be shown as paid or failed.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 50, default: 20 }
+        - name: cursor
+          in: query
+          required: false
+          description: Opaque cursor from a previous response's `nextCursor`. Never construct one.
+          schema: { type: string, maxLength: 200 }
+        - name: type
+          in: query
+          required: false
+          description: Comma-separated transaction types (exact, case-sensitive).
+          schema: { type: string }
+          example: Wallet Top-Up
+        - name: status
+          in: query
+          required: false
+          description: Comma-separated statuses (exact, case-sensitive), e.g. `Success,Failed`.
+          schema: { type: string }
+          example: Success,Failed
+        - name: from
+          in: query
+          required: false
+          description: Inclusive start date, UTC (`yyyy-MM-dd`).
+          schema: { type: string, format: date }
+        - name: to
+          in: query
+          required: false
+          description: Inclusive end date, UTC (`yyyy-MM-dd`); covers the whole day.
+          schema: { type: string, format: date }
+      responses:
+        "200":
+          description: A page of transactions.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WalletTransactionList"
+              examples:
+                populated:
+                  value:
+                    items:
+                      - { id: "a36XX000000EXMPLAA", reference: "TOPUP-001XX000003DHPhQAO-1790000000000", type: "Wallet Top-Up", status: "Success", paymentSource: "Flutterwave", amount: 50, creditApplied: true, createdAt: "2026-01-15T09:30:00.000Z" }
+                      - { id: "a36XX000000EXMPLAB", reference: null, type: "Wallet Top-Up", status: "Success", paymentSource: "MoMo-MTN", amount: null, creditApplied: false, createdAt: "2026-01-10T08:00:00.000Z" }
+                    nextCursor: "MTc5MDAwMDAwMDAwMHxhMzZYWDAwMDAwMEVYTVBMQUE"
+                empty:
+                  value: { items: [], nextCursor: null }
+        "400":
+          description: A query parameter is malformed or has an unknown value.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example: { error: "Invalid query parameter" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: Token is missing `contactId`/`accountId` claims, or the caller is not a Sponsor.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                registrationIncomplete:
+                  value: { error: "Registration incomplete" }
+                notSponsor:
+                  value: { error: "This action requires the Sponsor role" }
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "502":
+          description: Salesforce returned an unexpected error. The upstream body is not forwarded.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example: { error: "Failed to fetch wallet transactions" }
+
+  /wallet/transactions/{id}:
+    get:
+      tags: [Wallet]
+      operationId: getWalletTransaction
+      summary: Get one wallet transaction
+      description: >-
+        One wallet transaction for the calling Sponsor's account. Read-only.
+        **Sponsor role only** (any other role gets `403`). Requires an ID token
+        carrying `contactId`/`accountId` claims.
+
+        Ids are opaque strings compared exactly. A 15-character id is accepted
+        in the path, but the response `id` is always the 18-character form.
+
+        `404` is deliberately identical for a transaction that does not exist,
+        one that belongs to another account, and an id that is not a wallet
+        transaction id. A malformed id is `400`. Same item shape, scope
+        (wallet ledger rows only, account-level) and status handling as
+        `GET /wallet/transactions`; `amount` and `reference` can be null, and
+        currency and the Email field are never returned.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Transaction id from the list (15 or 18 letters/digits).
+          schema: { type: string, pattern: "^([A-Za-z0-9]{15}|[A-Za-z0-9]{18})$" }
+          example: a36XX000000EXMPLAA
+      responses:
+        "200":
+          description: The transaction.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WalletTransaction"
+              example: { id: "a36XX000000EXMPLAA", reference: "TOPUP-001XX000003DHPhQAO-1790000000000", type: "Wallet Top-Up", status: "Success", paymentSource: "Flutterwave", amount: 50, creditApplied: true, createdAt: "2026-01-15T09:30:00.000Z" }
+        "400":
+          description: The id is malformed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example: { error: "A valid transaction id is required" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: Token is missing `contactId`/`accountId` claims, or the caller is not a Sponsor.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                registrationIncomplete:
+                  value: { error: "Registration incomplete" }
+                notSponsor:
+                  value: { error: "This action requires the Sponsor role" }
+        "404":
+          description: Not found, belongs to another account, or not a wallet transaction id (all identical).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example: { error: "Transaction not found" }
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "502":
+          description: Salesforce returned an unexpected error. The upstream body is not forwarded.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example: { error: "Failed to fetch wallet transaction" }
+
+  /wallet/topups/{reference}:
+    get:
+      tags: [Wallet]
+      operationId: getWalletTopUpStatus
+      summary: Poll the status of a wallet top-up
+      description: >-
+        Returns the status of one wallet top-up, identified by the
+        `gatewayReference` returned from `POST /wallet/topup`. The app polls
+        this after the Flutterwave checkout redirect until `status` is
+        `Success` or `Failed`. Read-only.
+
+        **Sponsor role only** (any other role gets `403`). Requires an ID token
+        carrying `contactId`/`accountId` claims.
+
+        **Currency is intentionally omitted** pending the LRD/NGN decision.
+        `amount` is the amount recorded at initiation, not
+        a value re-read from the payment provider.
+
+        A reference that does not exist and a reference that belongs to another
+        account both return the same `404`, so existence is never revealed. Only
+        Wallet Top-Up transactions are returned.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: reference
+          in: path
+          required: true
+          description: The `gatewayReference` from `POST /wallet/topup` (1-255 chars, letters, digits, `_` and `-`).
+          schema: { type: string, pattern: "^[A-Za-z0-9_-]{1,255}$" }
+          example: TOPUP-001XX000003DHPhQAO-1790000000000
+      responses:
+        "200":
+          description: Top-up status.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WalletTopUpStatus"
+              examples:
+                credited:
+                  value: { reference: "TOPUP-001XX000003DHPhQAO-1790000000000", status: "Success", amount: 50, creditApplied: true, updatedAt: "2026-01-15T09:30:20.000Z" }
+                pending:
+                  value: { reference: "TOPUP-001XX000003DHPhQAO-1790000600000", status: "Pending", amount: 50, creditApplied: false, updatedAt: "2026-01-14T17:20:00.000Z" }
+        "400":
+          description: The reference is malformed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example: { error: "A valid top-up reference is required" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: Token is missing `contactId`/`accountId` claims, or the caller is not a Sponsor.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                registrationIncomplete:
+                  value: { error: "Registration incomplete" }
+                notSponsor:
+                  value: { error: "This action requires the Sponsor role" }
+        "404":
+          description: No such top-up on the caller's account (also returned for another account's reference).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example: { error: "Top-up not found" }
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "502":
+          description: Salesforce returned an unexpected error. The upstream body is not forwarded.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example: { error: "Failed to fetch top-up status" }
 
   /wallet/topup:
     post:
-      tags: [Wallet Top-Up (Flutterwave)]
+      tags: [Wallet]
       operationId: initiateWalletTopup
       summary: Initiate a Flutterwave wallet top-up
       description: >-
         Single endpoint that starts a wallet top-up end to end: creates a
-        Pending `Wallet_Transaction__c` in Salesforce, then immediately
-        initializes the actual payment with Flutterwave's API using the SAME
-        reference Salesforce just generated as `tx_ref` — so
-        `FlutterwaveWebhookResource` can later match Flutterwave's
+        Pending transaction record in Salesforce, then immediately initializes the
+        actual payment with Flutterwave's API using the SAME reference Salesforce
+        just generated as `tx_ref` — so the server can later match Flutterwave's
         payment-succeeded callback back to this exact transaction. The RN app
         gets back a single response with everything needed to launch checkout;
         no separate manual Flutterwave call is required.
@@ -1055,15 +1577,14 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           description: >-
-            Passthrough from Salesforce — no `CareRoute_Wallet__c` exists for
+            Passthrough from Salesforce — no wallet exists for
             this caller's Account.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ErrorWithDetail"
+                $ref: "#/components/schemas/Error"
               example:
                 error: "Could not create top-up transaction"
-                detail: "{\"error\":\"No wallet found for this account\"}"
         "500":
           description: >-
             Could not reach Salesforce at all, or the Salesforce transaction was
@@ -1072,7 +1593,7 @@ paths:
           content:
             application/json:
               schema:
-                oneOf:
+                anyOf:
                   - $ref: "#/components/schemas/Error"
                   - $ref: "#/components/schemas/TopUpPartialFailure"
               examples:
@@ -1087,22 +1608,20 @@ paths:
         "502":
           description: >-
             Either the Salesforce Apex REST call returned an unexpected non-2xx,
-            non-404 response — e.g. a non-Sponsor caller gets
-            `"This action requires role: Sponsor"` from
-            `CareRouteApiUtils.requireRole()` — or Salesforce succeeded but
+            non-404 response — e.g. a non-Sponsor caller is
+            refused — or Salesforce succeeded but
             Flutterwave rejected the payment initialization itself.
           content:
             application/json:
               schema:
-                oneOf:
-                  - $ref: "#/components/schemas/ErrorWithDetail"
+                anyOf:
+                  - $ref: "#/components/schemas/Error"
                   - $ref: "#/components/schemas/TopUpPartialFailure"
               examples:
                 salesforceRejected:
                   summary: Salesforce Apex REST call failed, e.g. caller isn't a Sponsor
                   value:
                     error: "Could not create top-up transaction"
-                    detail: "{\"error\":\"This action requires role: Sponsor\"}"
                 flutterwaveRejected:
                   summary: Salesforce transaction created, but Flutterwave itself rejected the payment
                   value:
@@ -1123,14 +1642,13 @@ paths:
           Full detail, including `knownConditions`/`knownAllergies`.
         - **Sponsor**: `patientContactId` must be a DEPENDENT's contactId under
           the caller's own Account. Summary only — `knownConditions` and
-          `knownAllergies` are omitted — and further gated by that specific
-          `Medical_Record__c`'s `Payer_Read_Only_Access_Granted__c` flag, which
-          can revoke a Sponsor's access to one patient's record independent of
+          `knownAllergies` are omitted — and further gated by a per-patient access
+          flag, which can revoke a Sponsor's access to one patient's record independent of
           the Account relationship (`403 Payer access has been revoked for this
           record` if so).
         - **Doctor/Nurse**: `patientContactId` can be ANY patient this specific
-          provider has an on-file `Visit_Record__c` for
-          (`Attending_Provider__c` = their own contactId) — not limited to
+          provider
+          has an on-file visit for (as the attending provider) — not limited to
           patients under any particular Account. Full detail, same as a
           Patient viewing their own record. There's no endpoint in this API
           for creating that Visit Record relationship; it has to already exist
@@ -1199,11 +1717,11 @@ paths:
                   summary: >-
                     Wrong relationship for the role (not the caller's own
                     contactId, not their dependent, or — for a provider — no
-                    matching Visit_Record__c with this patient)
-                  value: { error: "Failed to fetch medical record", detail: "{\"error\":\"Not authorized to view this medical record\"}" }
+                    matching visit on file with this patient)
+                  value: { error: "Failed to fetch medical record" }
                 payerAccessRevoked:
                   summary: Sponsor's access to this specific patient's record was explicitly revoked
-                  value: { error: "Failed to fetch medical record", detail: "{\"error\":\"Payer access has been revoked for this record\"}" }
+                  value: { error: "Failed to fetch medical record" }
         "404":
           description: >-
             No medical record exists yet for that Contact — expected until one is
@@ -1211,10 +1729,9 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ErrorWithDetail"
+                $ref: "#/components/schemas/Error"
               example:
                 error: "Failed to fetch medical record"
-                detail: "NOT_FOUND"
         "500":
           $ref: "#/components/responses/InternalError"
         "502":
@@ -1222,10 +1739,9 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ErrorWithDetail"
+                $ref: "#/components/schemas/Error"
               example:
                 error: "Failed to fetch medical record"
-                detail: "INTERNAL_SERVER_ERROR"
 
 components:
   securitySchemes:
@@ -1240,6 +1756,7 @@ components:
         Its decoded payload may carry `contactId`, `accountId`, and `role` custom
         claims — see `CallerIdentity` — which several endpoints additionally
         require to be present, returning `403 Registration incomplete` otherwise.
+
 
   schemas:
     HealthStatus:
@@ -1267,16 +1784,7 @@ components:
           type: string
           description: Human-readable error message.
 
-    ErrorWithDetail:
-      description: >-
-        An Error whose `detail` field carries the raw response body (or a short
-        code) from the upstream Salesforce Apex REST call.
-      allOf:
-        - $ref: "#/components/schemas/Error"
-        - type: object
-          properties:
-            detail:
-              type: string
+
 
     PartialSuccessError:
       description: >-
@@ -1298,6 +1806,7 @@ components:
       required: [success]
       properties:
         success: { type: boolean, const: true }
+
 
     CustomTokenResponse:
       type: object
@@ -1374,14 +1883,14 @@ components:
       description: >-
         Success response for `POST /provider/claim`. Deliberately has NO
         `accountId` field, unlike `RegistrationResult` — providers have no
-        Salesforce Account relationship (see `ProviderClaimEndpoint`).
+        Salesforce Account relationship.
       type: object
       required: [contactId, careTeamMemberId, role, wasExisting]
       properties:
         contactId: { type: string }
         careTeamMemberId:
           type: string
-          description: Salesforce Id of the provider's Care_Team_Member__c record.
+          description: Salesforce Id of the provider's profile record.
         role:
           type: string
           examples: ["Doctor", "Nurse"]
@@ -1400,13 +1909,12 @@ components:
       properties:
         transactionId:
           type: string
-          description: Salesforce Id of the new Wallet_Transaction__c record.
+          description: Salesforce Id of the new transaction record.
         gatewayReference:
           type: string
           description: >-
             Also used as Flutterwave's `tx_ref` — this is what
-            FlutterwaveWebhookResource matches the later payment callback
-            against.
+            the server matches the later payment callback against.
         amount:
           type: number
         checkoutLink:
@@ -1427,7 +1935,7 @@ components:
           properties:
             transactionId:
               type: string
-              description: The Salesforce Wallet_Transaction__c Id created before the failure.
+              description: The Salesforce transaction Id created before the failure.
 
     DependentRecord:
       description: >-
@@ -1449,74 +1957,178 @@ components:
         phone: "+231770000002"
 
     ProfileRecord:
-      description: >-
-        Response shape for `GET /me`, passed through from the Salesforce `me`
-        Apex REST endpoint as-is. The exact field list is defined by that Apex
-        controller (not present in this repo); fields below are illustrative —
-        confirm against the Apex source before relying on any field not listed
-        here.
+      description: Response shape for `GET /me`.
       type: object
-      additionalProperties: true
+      required: [contactId, accountId, firstName, lastName, phone, email, role, isPrimaryContact, accountType, accountName]
       properties:
         contactId: { type: string }
-        accountId: { type: string }
-        role: { type: string }
-        firstName: { type: string }
+        accountId: { type: [string, "null"], description: "Null for providers, who have no Account." }
+        firstName: { type: [string, "null"] }
         lastName: { type: string }
+        phone: { type: [string, "null"] }
+        email: { type: [string, "null"] }
+        role: { type: string, description: "Sponsor, Patient, Doctor or Nurse." }
+        isPrimaryContact: { type: [boolean, "null"] }
+        accountType: { type: [string, "null"] }
+        accountName: { type: [string, "null"] }
       example:
         contactId: "003XX000004TmiQQAS"
         accountId: "001XX000003DHPhQAO"
-        role: "Sponsor"
         firstName: "John"
         lastName: "Doe"
-
+        phone: "+231770000001"
+        email: "johndoe@example.com"
+        role: "Sponsor"
+        isPrimaryContact: true
+        accountType: "Sponsor"
+        accountName: "John Doe"
     SubscriptionStatus:
-      description: >-
-        Response shape for `GET /subscription/status`, passed through from the
-        Salesforce `subscription/status` Apex REST endpoint as-is. The exact
-        field list is defined by that Apex controller (not present in this repo);
-        `status` is confirmed to always currently read `"Pending"` — see the
-        top-level known-limitations note.
+      description: Response shape for `GET /subscription/status`.
       type: object
-      additionalProperties: true
+      required: [status, planType, visitsRemaining, renewalDate]
       properties:
         status:
-          type: string
-          example: "Pending"
-
+          type: [string, "null"]
+          description: "One of Active, Pending, Paused/ Suspended, Expired, Cancelled. For display only: to decide whether care can be requested use GET /care-requests/eligibility and its reasonCode."
+          example: "Active"
+        planType: { type: [string, "null"], description: "Plan label, e.g. Sponsor ($150)." }
+        visitsRemaining: { type: [number, "null"], description: "Visits left in the current period." }
+        renewalDate: { type: [string, "null"], format: date, description: "Next renewal date (yyyy-MM-dd)." }
     WalletBalance:
-      description: >-
-        Response shape for `GET /wallet/balance`, passed through from the
-        Salesforce `wallet/balance` Apex REST endpoint as-is. The exact field
-        list is defined by that Apex controller (not present in this repo);
-        fields below are illustrative — confirm against the Apex source.
+      description: Response shape for `GET /wallet/balance`. No currency is returned pending the currency decision.
       type: object
-      additionalProperties: true
+      required: [currentBalance, lowBalanceThreshold, walletStatus]
       properties:
-        balance: { type: number }
-        currency: { type: string, example: "USD" }
+        currentBalance: { type: [number, "null"] }
+        lowBalanceThreshold: { type: [number, "null"], description: "Balance at which a low-balance alert is sent; null if not set." }
+        walletStatus: { type: [string, "null"], description: "Active, Frozen or Closed; null on older wallets." }
+    DependentList:
+      description: "Response of `GET /dependents`. List endpoints share the `{ items: [...] }` convention (no cursor)."
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          maxItems: 200
+          items:
+            type: object
+            required: [id, firstName, lastName, claimed, appAccountCreated]
+            properties:
+              id: { type: string, description: Salesforce Contact Id. }
+              firstName: { type: [string, "null"] }
+              lastName: { type: string }
+              claimed:
+                type: boolean
+                description: True when the dependent has signed in and linked their own login. No login identifier is ever returned.
+              appAccountCreated:
+                type: boolean
+                description: True once the dependent's app account has been created.
+
+    WalletTransaction:
+      description: One wallet ledger row. No currency and no email field by design.
+      type: object
+      required: [id, reference, type, status, paymentSource, amount, creditApplied, createdAt]
+      properties:
+        id: { type: string }
+        reference: { type: [string, "null"], description: "Payment reference; null on some older records." }
+        type: { type: [string, "null"], description: "Transaction type, e.g. Wallet Top-Up." }
+        status:
+          type: string
+          description: >-
+            Status verbatim. Success = paid, Failed = failed, Pending = processing
+            (under 24h) or abandoned (over 24h); any other value is neutral.
+        paymentSource: { type: [string, "null"], description: "Payment source, e.g. Flutterwave or MoMo-MTN." }
+        amount: { type: [number, "null"], description: Amount recorded at initiation. }
+        creditApplied: { type: boolean, description: True once the wallet balance has been credited. }
+        createdAt: { type: string, format: date-time, description: CreatedDate, UTC. }
+
+    WalletTransactionList:
+      description: Response of `GET /wallet/transactions`.
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          maxItems: 50
+          items:
+            $ref: "#/components/schemas/WalletTransaction"
+        nextCursor:
+          type: [string, "null"]
+          description: Opaque; pass back as `cursor` for the next page. Null on the last page.
+
+    ProviderProfile:
+      description: Response of `GET /provider/me`. Bank/payout and licence data are never included.
+      type: object
+      required: [providerType, specialisation, vettingStatus, onDuty, availabilityStatus, rating, totalCompletedVisits, totalDispatches, averageResponseTimeMins]
+      properties:
+        providerType: { type: [string, "null"], enum: [Doctor, Nurse, null] }
+        specialisation: { type: [string, "null"] }
+        vettingStatus:
+          type: [string, "null"]
+          description: "Pending = awaiting admin approval; Vetted = approved; Suspended = admin-set. Other/null = neutral blocked screen."
+          example: Vetted
+        onDuty: { type: boolean }
+        availabilityStatus:
+          type: [string, "null"]
+          description: Available, Busy or Off Duty; null if never set.
+        rating: { type: [number, "null"], description: "2 decimals; null today (nothing populates it)." }
+        totalCompletedVisits: { type: [integer, "null"], description: Null today. }
+        totalDispatches: { type: [integer, "null"], description: Null today. }
+        averageResponseTimeMins: { type: [integer, "null"], description: Null today. }
+
+    CareRequestEligibility:
+      description: Advisory result of `GET /care-requests/eligibility`. Enforcement stays in Salesforce at create time.
+      type: object
+      required: [eligible, reasonCode, visitsRemaining, subscriptionStatus]
+      properties:
+        eligible: { type: boolean }
+        reasonCode:
+          type: [string, "null"]
+          description: Null when eligible. Treat an unknown future value as "not eligible".
+          enum: [NO_SUBSCRIPTION, SUBSCRIPTION_PENDING, SUBSCRIPTION_SUSPENDED, SUBSCRIPTION_EXPIRED, SUBSCRIPTION_CANCELLED, VISITS_EXHAUSTED, SUBSCRIPTION_INACTIVE, null]
+        visitsRemaining: { type: [integer, "null"], description: Null when there is no subscription. }
+        subscriptionStatus:
+          type: [string, "null"]
+          description: Raw subscription status (e.g. "Paused/ Suspended"). For display or logging only; never branch on it, use reasonCode.
+
+    WalletTopUpStatus:
+      description: >-
+        Response of `GET /wallet/topups/{reference}`. No currency field: it is
+        intentionally omitted pending the LRD/NGN decision.
+      type: object
+      required: [reference, status, amount, creditApplied, updatedAt]
+      properties:
+        reference: { type: string }
+        status:
+          type: string
+          description: Transaction status, value verbatim.
+          example: Success
+        amount:
+          type: [number, "null"]
+          description: Amount recorded at initiation.
+        creditApplied:
+          type: boolean
+          description: True once the wallet balance has been credited.
+        updatedAt: { type: string, format: date-time }
 
     MedicalRecord:
       description: >-
-        Response shape for `GET /medical-record` — matches
-        `MedicalRecordEndpoint.MedicalRecordResponse` exactly.
+        Response shape for `GET /medical-record` — matches the
+        server response exactly.
         `knownConditions`/`knownAllergies` are free-text strings (not arrays),
-        and are `null` for Sponsor-role callers (`isFullAccess = false` in
-        Apex) — Patient/Dependent and Doctor/Nurse callers get both fields
+        and are `null` for Sponsor-role callers (summary view) — Patient/Dependent and Doctor/Nurse callers get both fields
         populated.
       type: object
       required: [recordCreatedDate, totalVisitsOnRecord, lastVisitDate]
       properties:
         recordCreatedDate: { type: string, format: date }
         totalVisitsOnRecord: { type: integer }
-        lastVisitDate: { type: string, format: date, nullable: true }
+        lastVisitDate: { type: [string, "null"], format: date }
         knownConditions:
-          type: string
-          nullable: true
+          type: [string, "null"]
           description: Free-text. Null/absent for Sponsor-role callers.
         knownAllergies:
-          type: string
-          nullable: true
+          type: [string, "null"]
           description: Free-text. Null/absent for Sponsor-role callers.
       example:
         recordCreatedDate: "2025-03-10"
