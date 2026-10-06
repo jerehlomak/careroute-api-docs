@@ -97,11 +97,13 @@ tags:
   - name: Push Notifications
     description: >-
       Registering a device token is a normal call any signed-in identity can
-      make. Sending a push notification is not part of the mobile API surface.
+      make. Actually sending a push is NOT part of the mobile API surface —
+      it's called server-to-server by Salesforce's PushNotificationSender,
+      authenticated by a shared secret instead of a Firebase ID token.
   - name: Wallet
     description: Wallet balance, top-ups and transaction history. Sponsor-role only.
   - name: Care Requests
-    description: Care request pre-checks and (later) creation.
+    description: Care request eligibility pre-check and creation.
   - name: Account Data (Tier 1)
     description: Read-only account data proxied to Salesforce, gated on the caller's CallerIdentity claims.
   - name: Health Checks
@@ -488,9 +490,211 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Error"
+                $ref: "#/components/schemas/ErrorWithDetail"
               example:
                 error: "Registration failed on Salesforce side"
+                detail: "{\"message\":\"DUPLICATE_VALUE\"}"
+
+  /care-requests:
+    get:
+      tags: [Care Requests]
+      operationId: listCareRequests
+      summary: List the caller's care requests
+      description: |-
+        A **Sponsor** sees the requests of their account; a **Patient** sees only their own. Doctor and Nurse tokens get 403. A request that does not exist, is not yours, or has a malformed id returns the identical 404.
+
+        Newest first, cursor-paginated. Pass `nextCursor` back unchanged as `cursor`; it is `null` on the last page. Status values: `Submitted`, `Dispatched`, `Provider Accepted`, `Provider Arrived/ In Progress`, `Complete`, `Escalated`, `Cancelled` (exact, case-sensitive). Show wording from the value; do not parse it.
+
+        **provider** is `{ name, type, rating }` once someone is assigned, otherwise `null`. It never includes a phone number or location. Treat `null` as "no provider yet". **Items never include symptoms or the confirmation code**; use the detail call for those.
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 50, default: 20 } }
+        - { name: cursor, in: query, required: false, description: Opaque; the nextCursor of the previous page., schema: { type: string } }
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [Submitted, Dispatched, Provider Accepted, "Provider Arrived/ In Progress", Complete, Escalated, Cancelled]
+      responses:
+        "200":
+          description: A page of requests.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CareRequestList"
+              example: { items: [ { id: "a2vXX000001AbCdYAK", status: "Dispatched", createdAt: "2026-09-30T08:15:00.000Z", patient: { id: "003XX00001PhybaYAB", name: "Anthony Doe" }, provider: { name: "Dora Doc", type: "Doctor", rating: 4.5 } } ], nextCursor: null }
+        "400":
+          description: Invalid limit, cursor or status.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CareRequestError"
+              example: { error: "Invalid query parameter: status", code: "INVALID_REQUEST" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: Registration incomplete, or not a Sponsor or Patient.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example: { error: "This action requires the Sponsor or Patient role" }
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "502":
+          description: Salesforce returned an unexpected error. The upstream body is not forwarded.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example: { error: "Failed to fetch care requests" }
+    post:
+      tags: [Care Requests]
+      operationId: createCareRequest
+      summary: Create a care request
+      description: |-
+        Creates a care request for the caller (Patient) or for a dependent of the
+        caller's account (Sponsor). Returns immediately; finding a provider starts
+        on the server as part of the save.
+
+        Requires an ID token with `contactId` and `accountId` claims and role
+        **Sponsor** or **Patient**; Doctor and Nurse get `403`.
+
+        **Idempotency-Key (required).** Generate **one fresh random key (for example a UUID v4) per submit attempt**: when the user taps *Request care* create the key, keep it for that attempt, and **reuse the same key only to retry that same attempt** (timeout, dropped connection, app restart before an answer). Never reuse a key for a different request, and never derive it from the symptoms or location. Same key + same caller + same patient returns the original request with `200` (no second request, same confirmation code); a `201` means it was created just now. The same key used for a different patient or by someone who could not see that request gets `409 IDEMPOTENCY_KEY_CONFLICT` and no request details. 8-100 characters: letters, digits, `_` and `-`.
+
+        **Location must be the patient's, never the sponsor's device.** When a Sponsor requests care for a dependent, send the *dependent's* coordinates (where the visit will happen), not the sponsor's phone location; providers are sent to these coordinates. `latitude` and `longitude` are both required. Coordinates outside the service area (a generous box around Liberia) are rejected with `422 OUTSIDE_SERVICE_AREA`; this catches swapped latitude/longitude, `0,0` and positions from another country.
+
+        **Rules.** One open request per patient: a patient with a request in Submitted, Dispatched, Provider Accepted, Provider Arrived/ In Progress or Escalated gets `409 OPEN_REQUEST_EXISTS` with `existingRequestId` (open that request instead of creating another). A Patient can only request for themselves (`patientContactId`, if sent, must be their own, else `403`). A Sponsor can request for themselves or for a dependent on their own account; any other id, including one from another account, returns the identical `404 PATIENT_NOT_FOUND`. The subscription is chosen by the server (same rule as the eligibility check); the client never sends one. `status`, `confirmationCode`, account and provider fields in the body are ignored.
+
+        **Reading the answer.** `status` and `dispatchState` describe what happened right after creation: `PENDING_DISPATCH` (`status` = Submitted) means the request is saved and we are still finding a provider; `DISPATCHED` (`status` = Dispatched) means a provider has been notified. Neither means a provider has *accepted*. Both are normal `201` outcomes: show "request received" and the `confirmationCode`, then follow progress with the request-detail call. `dispatchState` is `null` on a replay once the request has moved on. Do not treat `PENDING_DISPATCH` as an error.
+
+        **Retries.** On a network error, `502` or a `5xx` without a request id,
+        retry with the **same** `Idempotency-Key`. On `500 UNEXPECTED_STATE` the
+        request was created: use the returned `id` and do not retry with a new key.
+
+        `NOT_ELIGIBLE` carries a `reasonCode`, one of `NO_SUBSCRIPTION`,
+        `SUBSCRIPTION_PENDING`, `SUBSCRIPTION_SUSPENDED`, `SUBSCRIPTION_EXPIRED`,
+        `SUBSCRIPTION_CANCELLED`, `VISITS_EXHAUSTED`, `SUBSCRIPTION_INACTIVE` or
+        `BLOCKED_BY_RULE` (same codes as the eligibility check plus a rare
+        save-time refusal). Codes only; the app owns the wording.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          description: One fresh random key per submit attempt; reuse only to retry that same attempt.
+          schema:
+            type: string
+            minLength: 8
+            maxLength: 100
+            pattern: "^[A-Za-z0-9_-]{8,100}$"
+          example: 3f2b9c1e-7d54-4a6b-9a10-0c1d2e3f4a5b
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateCareRequestBody"
+            examples:
+              forDependent:
+                summary: Sponsor requesting for a dependent
+                value: { patientContactId: "003XX00001QMgFvYAL", symptoms: "Fever and headache since yesterday", landmark: "Near the Waterside market", latitude: 6.3005, longitude: -10.7969 }
+              forSelf:
+                summary: Patient requesting for themselves
+                value: { symptoms: "Persistent cough", latitude: 6.3005, longitude: -10.7969 }
+      responses:
+        "201":
+          description: The request was created just now.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CareRequestCreated"
+              examples:
+                findingProvider:
+                  value: { id: "a0dXX000001AbCdYAK", status: "Submitted", confirmationCode: "K7Q2ZM", createdAt: "2026-09-30T08:15:00.000Z", dispatchState: "PENDING_DISPATCH" }
+                providerNotified:
+                  value: { id: "a0dXX000001AbCdYAK", status: "Dispatched", confirmationCode: "K7Q2ZM", createdAt: "2026-09-30T08:15:00.000Z", dispatchState: "DISPATCHED" }
+        "200":
+          description: Replay of the same Idempotency-Key. The original request is returned; nothing new was created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CareRequestCreated"
+              example: { id: "a0dXX000001AbCdYAK", status: "Dispatched", confirmationCode: "K7Q2ZM", createdAt: "2026-09-30T08:15:00.000Z", dispatchState: "DISPATCHED" }
+        "400":
+          description: Missing or invalid Idempotency-Key, body, or field.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CareRequestError"
+              examples:
+                missingKey:
+                  value: { error: "Idempotency-Key header is required", code: "INVALID_REQUEST" }
+                missingSymptoms:
+                  value: { error: "symptoms is required (up to 2000 characters)", code: "INVALID_REQUEST" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: Registration incomplete, not a Sponsor or Patient, or a Patient asking for someone else.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                registrationIncomplete:
+                  value: { error: "Registration incomplete" }
+                wrongRole:
+                  value: { error: "This action requires the Sponsor or Patient role" }
+                notYou:
+                  value: { error: "Not allowed" }
+        "404":
+          description: The patient does not exist or is not on the caller's account (the two cases are indistinguishable).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CareRequestError"
+              example: { error: "Patient not found", code: "PATIENT_NOT_FOUND" }
+        "409":
+          description: Open request already exists, not eligible, or the Idempotency-Key belongs to a different request.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CareRequestError"
+              examples:
+                openRequest:
+                  value: { error: "Patient already has an open care request", code: "OPEN_REQUEST_EXISTS", existingRequestId: "a0dXX000001AbCdYAK" }
+                notEligible:
+                  value: { error: "Care request not allowed", code: "NOT_ELIGIBLE", reasonCode: "VISITS_EXHAUSTED" }
+                keyConflict:
+                  value: { error: "Idempotency-Key was already used for a different request", code: "IDEMPOTENCY_KEY_CONFLICT" }
+        "422":
+          description: The location is outside the service area.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CareRequestError"
+              example: { error: "Location is outside the service area", code: "OUTSIDE_SERVICE_AREA" }
+        "500":
+          description: Internal error, or the request was created but is in an unexpected state (`UNEXPECTED_STATE`, with the request `id`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CareRequestError"
+              examples:
+                internal:
+                  value: { error: "Internal error" }
+                unexpectedState:
+                  value: { error: "Care request was created in an unexpected state", code: "UNEXPECTED_STATE", id: "a0dXX000001AbCdYAK", status: "Escalated" }
+        "502":
+          description: Salesforce returned an unexpected error. The upstream body is not forwarded. Retry with the same Idempotency-Key.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example: { error: "Failed to create care request" }
 
   /care-requests/eligibility:
     get:
@@ -559,6 +763,65 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
               example: { error: "Failed to fetch eligibility" }
+
+  /care-requests/{id}:
+    get:
+      tags: [Care Requests]
+      operationId: getCareRequest
+      summary: Get one care request
+      description: |-
+        A **Sponsor** sees the requests of their account; a **Patient** sees only their own. Doctor and Nurse tokens get 403. A request that does not exist, is not yours, or has a malformed id returns the identical 404.
+
+        **confirmationCode is shown only while the request is Submitted, Dispatched or Provider Accepted**; in every other status (Provider Arrived/ In Progress, Complete, Escalated, Cancelled) it is `null`. Handle `null` and do not cache the code.
+
+        **provider** is `{ name, type, rating }` once someone is assigned, otherwise `null`. It never includes a phone number or location. Treat `null` as "no provider yet".
+
+        `/care-requests/eligibility` is a separate fixed path and is never treated as an id.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+          example: "a2vXX000001AbCdYAK"
+      responses:
+        "200":
+          description: The request.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CareRequestDetail"
+              examples:
+                dispatched:
+                  value: { id: "a2vXX000001AbCdYAK", status: "Dispatched", createdAt: "2026-09-30T08:15:00.000Z", symptoms: "Fever and headache since yesterday", landmark: "Near the Waterside market", patient: { id: "003XX00001PhybaYAB", name: "Anthony Doe" }, provider: { name: "Dora Doc", type: "Doctor", rating: 4.5 }, confirmationCode: "K7Q2ZM" }
+                complete:
+                  value: { id: "a2vXX000001AbCdYAK", status: "Complete", createdAt: "2026-09-30T08:15:00.000Z", symptoms: "Fever and headache since yesterday", landmark: null, patient: { id: "003XX00001PhybaYAB", name: "Anthony Doe" }, provider: { name: "Dora Doc", type: "Doctor", rating: 4.5 }, confirmationCode: null }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: Registration incomplete, or not a Sponsor or Patient.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example: { error: "This action requires the Sponsor or Patient role" }
+        "404":
+          description: Not found, not yours, or a malformed id (identical response).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example: { error: "Care request not found" }
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "502":
+          description: Salesforce returned an unexpected error. The upstream body is not forwarded.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example: { error: "Failed to fetch care request" }
 
   /dependents:
     get:
@@ -691,15 +954,16 @@ paths:
                 registrationIncomplete:
                   value: { error: "Registration incomplete" }
                 sfForbidden:
-                  value: { error: "Failed to register dependent" }
+                  value: { error: "Failed to register dependent", detail: "Forbidden for this role" }
         "409":
           description: A dependent already exists for that phone number under this Account.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Error"
+                $ref: "#/components/schemas/ErrorWithDetail"
               example:
                 error: "Failed to register dependent"
+                detail: "DUPLICATE_DEPENDENT_PHONE"
         "500":
           $ref: "#/components/responses/InternalError"
         "502":
@@ -707,9 +971,10 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Error"
+                $ref: "#/components/schemas/ErrorWithDetail"
               example:
                 error: "Failed to register dependent"
+                detail: "INTERNAL_SERVER_ERROR"
 
   /dependent/claim:
     post:
@@ -784,9 +1049,10 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Error"
+                $ref: "#/components/schemas/ErrorWithDetail"
               example:
                 error: "Claim failed"
+                detail: "NOT_FOUND"
         "500":
           description: >-
             Could not reach Salesforce at all, or the claim succeeded on the
@@ -811,9 +1077,10 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Error"
+                $ref: "#/components/schemas/ErrorWithDetail"
               example:
                 error: "Claim failed"
+                detail: "INTERNAL_SERVER_ERROR"
 
   /provider/me:
     get:
@@ -880,6 +1147,413 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
               example: { error: "Failed to fetch provider profile" }
+
+  /provider/availability:
+    put:
+      tags: [Providers]
+      operationId: setMyAvailability
+      summary: Go on or off duty, or mark yourself Busy
+      description: |-
+        Sets the calling Doctor's or Nurse's own duty and availability. Requires a **provider** ID token (role `Doctor` or `Nurse`; no `accountId` needed). Sponsor and Patient tokens get `403`.
+
+        The provider must currently be **Vetted**. This is checked on the server on every call, so a provider whose account was set to `Pending` or `Suspended` after signing in gets `403` with code `NOT_VETTED` even though the token is still valid. Use `GET /provider/me` to decide which screen to show.
+
+        Send `onDuty` (required) and, optionally, `availabilityStatus`:
+
+        - `onDuty: false` always results in `Off Duty`.
+        - `onDuty: true` with no status results in `Available`.
+        - `onDuty: true` with `Busy` keeps you on duty but marks you busy.
+        - `onDuty: true` with `Off Duty` is rejected with `422 STATUS_CONFLICT`.
+
+        Any other field in the body is rejected with `400`; nothing is saved. The answer shows the values that were saved. How these values influence which provider is offered a visit is decided by the dispatch service and may change.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProviderAvailabilityRequest"
+            examples:
+              goOnDuty:
+                value: { onDuty: true }
+              busy:
+                value: { onDuty: true, availabilityStatus: "Busy" }
+              goOffDuty:
+                value: { onDuty: false }
+      responses:
+        "200":
+          description: The values that were saved.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderAvailability"
+              examples:
+                available:
+                  value: { onDuty: true, availabilityStatus: "Available" }
+                offDuty:
+                  value: { onDuty: false, availabilityStatus: "Off Duty" }
+        "400":
+          description: The body is not valid (missing or non-boolean `onDuty`, unknown status, or any other field).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderWriteError"
+              example: { error: "onDuty is required and must be true or false", code: "INVALID_REQUEST" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: Not a Doctor or Nurse, the token is missing `contactId`, or the provider is not Vetted (`NOT_VETTED`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderWriteError"
+              examples:
+                notProvider:
+                  value: { error: "This action requires the Doctor or Nurse role" }
+                registrationIncomplete:
+                  value: { error: "Registration incomplete" }
+                notVetted:
+                  value: { error: "Provider not vetted", code: "NOT_VETTED" }
+        "404":
+          description: No provider profile exists for this login.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderWriteError"
+              example: { error: "Provider profile not found" }
+        "422":
+          description: "`onDuty: true` cannot be combined with `Off Duty`."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderWriteError"
+              example: { error: "Off Duty cannot be set while on duty", code: "STATUS_CONFLICT" }
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "502":
+          description: The server could not confirm or save the change. Nothing from the upstream answer is forwarded; retry later.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderWriteError"
+              examples:
+                saveFailed:
+                  value: { error: "Failed to update availability" }
+                cannotVerify:
+                  value: { error: "Could not verify provider status" }
+
+  /provider/location:
+    put:
+      tags: [Providers]
+      operationId: setMyLocation
+      summary: Report your current position
+      description: |-
+        Reports the calling Doctor's or Nurse's own current position. Requires a **provider** ID token (role `Doctor` or `Nurse`; no `accountId` needed). Sponsor and Patient tokens get `403`.
+
+        The provider must currently be **Vetted**; this is checked on the server on every call (`403` with code `NOT_VETTED` otherwise), exactly as for `PUT /provider/availability`.
+
+        Send `latitude` and `longitude` as plain numbers (decimal degrees) and nothing else; any other field is rejected with `400` and nothing is saved. Exactly `0,0` is a placeholder, not a position, and is rejected with `422 INVALID_LOCATION`.
+
+        **Rate limit:** at most one accepted update every **5 seconds** per provider. A faster call gets `429 RATE_LIMITED` with a `Retry-After: 5` header and is not saved; send the next update after the delay. The answer only contains `updatedAt` (UTC); the coordinates are not echoed back.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProviderLocationRequest"
+            example: { latitude: 6.3005, longitude: -10.7969 }
+      responses:
+        "200":
+          description: The position was saved.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderLocationUpdated"
+              example: { updatedAt: "2026-10-02T20:18:44.123Z" }
+        "400":
+          description: The body is not valid (missing or non-numeric coordinates, out of range, or any other field).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderWriteError"
+              example: { error: "latitude is out of range", code: "INVALID_REQUEST" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: Not a Doctor or Nurse, the token is missing `contactId`, or the provider is not Vetted (`NOT_VETTED`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderWriteError"
+              examples:
+                notProvider:
+                  value: { error: "This action requires the Doctor or Nurse role" }
+                notVetted:
+                  value: { error: "Provider not vetted", code: "NOT_VETTED" }
+        "404":
+          description: No provider profile exists for this login.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderWriteError"
+              example: { error: "Provider profile not found" }
+        "422":
+          description: The position is the `0,0` placeholder.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderWriteError"
+              example: { error: "Location is not a real position", code: "INVALID_LOCATION" }
+        "429":
+          description: Too many updates; at most one every 5 seconds. Nothing was saved.
+          headers:
+            Retry-After:
+              description: Seconds to wait before the next update.
+              schema: { type: integer, example: 5 }
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderWriteError"
+              example: { error: "Too many location updates", code: "RATE_LIMITED" }
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "502":
+          description: The server could not confirm or save the change. Nothing from the upstream answer is forwarded; retry later.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderWriteError"
+              examples:
+                saveFailed:
+                  value: { error: "Failed to update location" }
+                cannotVerify:
+                  value: { error: "Could not verify provider status" }
+
+  /provider/dispatches:
+    get:
+      tags: [Providers]
+      operationId: listMyDispatches
+      summary: The calling Doctor's or Nurse's own active dispatches
+      description: |-
+        The caller's own Pending or Accepted dispatches, for requests still `Dispatched`, `Provider Accepted` or `Provider Arrived/ In Progress`. Requires a **provider** ID token (role `Doctor` or `Nurse`; no `accountId` needed). The provider must currently be **Vetted** (`403 NOT_VETTED` otherwise), exactly as for `PUT /provider/availability`.
+
+        **Pending** rows show `landmark`, `symptoms`, `distanceKm` and `secondsLeft` on the 7-minute acceptance window (`secondsLeft` is `null` once it would go negative, floored at 0, and also `null` if the window has no start time yet); `phone`, `latitude` and `longitude` are `null`.
+
+        **Accepted** rows show `phone` and the patient's exact `latitude`/`longitude` instead; `distanceKm` and `secondsLeft` are `null`.
+
+        A confirmation code is never included on any row, Pending or Accepted.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: The caller's active dispatches.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DispatchList"
+              examples:
+                mixed:
+                  value:
+                    items:
+                      - id: "a2xXX000001ExMPLAZ"
+                        careRequestId: "a2vXX000001AbCdYAK"
+                        status: "Pending"
+                        landmark: "Blue gate, third house"
+                        symptoms: "Fever and chills"
+                        distanceKm: 1.8
+                        secondsLeft: 340
+                        phone: null
+                        latitude: null
+                        longitude: null
+                      - id: "a2xXX000001ExMPLBZ"
+                        careRequestId: "a2vXX000001AbCdYAL"
+                        status: "Accepted"
+                        landmark: "Near the market"
+                        symptoms: "Chest pain"
+                        distanceKm: null
+                        secondsLeft: null
+                        phone: "0770000002"
+                        latitude: 6.31
+                        longitude: -10.79
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: Not a Doctor or Nurse, the token is missing `contactId`, or the provider is not Vetted (`NOT_VETTED`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderWriteError"
+              examples:
+                notProvider:
+                  value: { error: "This action requires the Doctor or Nurse role" }
+                notVetted:
+                  value: { error: "Provider not vetted", code: "NOT_VETTED" }
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "502":
+          description: The server could not fetch the list, or could not confirm the provider's status. Nothing from the upstream answer is forwarded; retry later.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderWriteError"
+              examples:
+                fetchFailed:
+                  value: { error: "Failed to fetch dispatches" }
+                cannotVerify:
+                  value: { error: "Could not verify provider status" }
+
+  /provider/dispatches/{id}/accept:
+    post:
+      tags: [Providers]
+      operationId: acceptDispatch
+      summary: Accept your own Pending dispatch
+      description: |-
+        Accepts one of the caller's own dispatches. Requires a **provider** ID token (role `Doctor` or `Nurse`). The provider must currently be **Vetted** (`403 NOT_VETTED` otherwise). Takes **no request body** at all; any body is rejected with `400`.
+
+        A dispatch that does not exist, is not yours, or has a malformed id all return the identical `404`. Accepting it requires the dispatch to still be Pending, the newest dispatch for its request, and the request still `Dispatched`; any other combination returns one fixed `409 NOT_ACCEPTABLE` (the response never says which of the three failed). Accepting any time before the 7-minute fallback window expires is the normal path, not a race.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Dispatch id from `GET /provider/dispatches` (15 or 18 letters/digits).
+          schema: { type: string, pattern: "^([A-Za-z0-9]{15}|[A-Za-z0-9]{18})$" }
+          example: a2xXX000001ExMPLAZ
+      responses:
+        "200":
+          description: Accepted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DispatchActionResult"
+              example: { status: "Accepted" }
+        "400":
+          description: A request body was sent; this action takes none.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderWriteError"
+              example: { error: "This action takes no request body", code: "INVALID_REQUEST" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: Not a Doctor or Nurse, the token is missing `contactId`, or the provider is not Vetted (`NOT_VETTED`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderWriteError"
+              examples:
+                notProvider:
+                  value: { error: "This action requires the Doctor or Nurse role" }
+                notVetted:
+                  value: { error: "Provider not vetted", code: "NOT_VETTED" }
+        "404":
+          description: Not found, not yours, or a malformed id (identical response).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderWriteError"
+              example: { error: "Dispatch not found" }
+        "409":
+          description: Not Pending, not the newest dispatch for its request, or the request is no longer Dispatched (identical response for all three).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderWriteError"
+              example: { error: "This dispatch can no longer be accepted", code: "NOT_ACCEPTABLE" }
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "502":
+          description: The server could not confirm or save the change. Nothing from the upstream answer is forwarded; retry later.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderWriteError"
+              examples:
+                saveFailed:
+                  value: { error: "Failed to accept dispatch" }
+                cannotVerify:
+                  value: { error: "Could not verify provider status" }
+
+  /provider/dispatches/{id}/reject:
+    post:
+      tags: [Providers]
+      operationId: rejectDispatch
+      summary: Reject your own Pending dispatch
+      description: |-
+        Rejects one of the caller's own dispatches. Requires a **provider** ID token (role `Doctor` or `Nurse`). The provider must currently be **Vetted** (`403 NOT_VETTED` otherwise). Takes **no request body** at all; any body is rejected with `400`.
+
+        A dispatch that does not exist, is not yours, or has a malformed id all return the identical `404`. The same eligibility rule as `accept` applies (Pending, newest for its request, request still `Dispatched`); anything else returns one fixed `409 NOT_REJECTABLE` — including rejecting a dispatch that was already Accepted.
+
+        On success, a same-type replacement provider is found and dispatched automatically when one is available; if not (attempt cap reached, or no alternate provider found), the request is left `Dispatched` with no assigned provider rather than failing the reject itself. Either way the caller only sees `{ "status": "Declined" }` — the reassignment outcome is not reported back to the rejecting provider.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Dispatch id from `GET /provider/dispatches` (15 or 18 letters/digits).
+          schema: { type: string, pattern: "^([A-Za-z0-9]{15}|[A-Za-z0-9]{18})$" }
+          example: a2xXX000001ExMPLAZ
+      responses:
+        "200":
+          description: Declined.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DispatchActionResult"
+              example: { status: "Declined" }
+        "400":
+          description: A request body was sent; this action takes none.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderWriteError"
+              example: { error: "This action takes no request body", code: "INVALID_REQUEST" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: Not a Doctor or Nurse, the token is missing `contactId`, or the provider is not Vetted (`NOT_VETTED`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderWriteError"
+              examples:
+                notProvider:
+                  value: { error: "This action requires the Doctor or Nurse role" }
+                notVetted:
+                  value: { error: "Provider not vetted", code: "NOT_VETTED" }
+        "404":
+          description: Not found, not yours, or a malformed id (identical response).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderWriteError"
+              example: { error: "Dispatch not found" }
+        "409":
+          description: Not Pending (including an already-Accepted dispatch), not the newest dispatch for its request, or the request is no longer Dispatched (identical response for all).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderWriteError"
+              example: { error: "This dispatch can no longer be rejected", code: "NOT_REJECTABLE" }
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "502":
+          description: The server could not confirm or save the change. Nothing from the upstream answer is forwarded; retry later.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderWriteError"
+              examples:
+                saveFailed:
+                  value: { error: "Failed to reject dispatch" }
+                cannotVerify:
+                  value: { error: "Could not verify provider status" }
 
   /provider/claim:
     post:
@@ -977,9 +1651,10 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Error"
+                $ref: "#/components/schemas/ErrorWithDetail"
               example:
                 error: "Claim failed"
+                detail: "{\"error\":\"Your registration is still under review. You will be notified once your account is approved.\"}"
         "404":
           description: >-
             No unclaimed provider record exists in Salesforce for this phone
@@ -988,9 +1663,10 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Error"
+                $ref: "#/components/schemas/ErrorWithDetail"
               example:
                 error: "Claim failed"
+                detail: "{\"error\":\"No provider registration found for this phone number. Contact your administrator if you believe this is an error.\"}"
         "500":
           description: >-
             Could not reach Salesforce at all, or the claim succeeded on the
@@ -1019,9 +1695,10 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Error"
+                $ref: "#/components/schemas/ErrorWithDetail"
               example:
                 error: "Claim failed"
+                detail: "{\"error\":\"Provider record is incomplete. Please contact support.\"}"
 
   /me:
     get:
@@ -1057,9 +1734,10 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Error"
+                $ref: "#/components/schemas/ErrorWithDetail"
               example:
                 error: "Failed to fetch profile"
+                detail: "NOT_FOUND"
         "500":
           $ref: "#/components/responses/InternalError"
         "502":
@@ -1067,9 +1745,10 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Error"
+                $ref: "#/components/schemas/ErrorWithDetail"
               example:
                 error: "Failed to fetch profile"
+                detail: "INTERNAL_SERVER_ERROR"
 
   /device-token:
     post:
@@ -1134,9 +1813,10 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Error"
+                $ref: "#/components/schemas/ErrorWithDetail"
               example:
                 error: "Could not register device"
+                detail: "{\"error\":\"No Contact found for this caller\"}"
         "500":
           $ref: "#/components/responses/InternalError"
         "502":
@@ -1145,10 +1825,107 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Error"
+                $ref: "#/components/schemas/ErrorWithDetail"
               example:
                 error: "Could not register device"
+                detail: "{\"error\":\"Failed to save device token: ... INSUFFICIENT_ACCESS_OR_READONLY ...\"}"
 
+  /internal/send-push:
+    post:
+      x-internal: true
+      tags: [Push Notifications]
+      operationId: sendInternalPush
+      summary: Send a push notification (internal, Salesforce-only)
+      description: >-
+        ⚠️ NOT part of the mobile API surface. Called server-to-server by
+        Salesforce's `PushNotificationSender`, authenticated by a shared
+        secret instead of any Firebase ID token — no `Authorization` header
+        is used here at all.
+      security:
+        - internalSecret: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [deviceToken, title, body]
+              properties:
+                deviceToken:
+                  type: string
+                  example: "fcm-test-token-abc123xyz"
+                title:
+                  type: string
+                  example: "Test Notification"
+                body:
+                  type: string
+                  example: "This is a test push from the CareRoute API demo."
+                data:
+                  type: object
+                  description: >-
+                    Arbitrary key/value pairs forwarded to FCM. Every value is
+                    coerced to a string server-side (FCM requires string-only
+                    data payloads), so numbers/booleans are accepted without
+                    the Apex caller needing to worry about it.
+                  additionalProperties: true
+                  example: { type: "test" }
+            example:
+              deviceToken: "fcm-test-token-abc123xyz"
+              title: "Test Notification"
+              body: "This is a test push from the CareRoute API demo."
+              data: { type: "test" }
+      responses:
+        "200":
+          description: Notification sent.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PushSendResult"
+              example:
+                success: true
+                messageId: "projects/careroute-auth-app/messages/0:1234567890"
+        "400":
+          description: A required field is missing.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                noDeviceToken:
+                  value: { error: "deviceToken is required" }
+                noTitleOrBody:
+                  value: { error: "title and body are required" }
+        "401":
+          description: Missing or mismatched `x-internal-secret` header.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: "Unauthorized"
+        "410":
+          description: >-
+            The device token is fake, expired, or the app was uninstalled —
+            the caller (Salesforce) should clear its stored `Device_Token__c`
+            rather than retry against a token that will never work again.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeadDeviceTokenError"
+              examples:
+                invalidToken:
+                  value: { error: "Device token is no longer valid", code: "messaging/invalid-registration-token" }
+                unregisteredToken:
+                  value: { error: "Device token is no longer valid", code: "messaging/registration-token-not-registered" }
+        "500":
+          description: Any other FCM error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorWithDetail"
+              example:
+                error: "Failed to send push notification"
+                detail: "Requested entity was not found."
 
   /subscription/status:
     get:
@@ -1189,9 +1966,10 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Error"
+                $ref: "#/components/schemas/ErrorWithDetail"
               example:
                 error: "Failed to fetch subscription status"
+                detail: "NOT_FOUND"
         "500":
           $ref: "#/components/responses/InternalError"
         "502":
@@ -1199,9 +1977,10 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Error"
+                $ref: "#/components/schemas/ErrorWithDetail"
               example:
                 error: "Failed to fetch subscription status"
+                detail: "INTERNAL_SERVER_ERROR"
 
   /wallet/balance:
     get:
@@ -1245,7 +2024,7 @@ paths:
                   value: { error: "Registration incomplete" }
                 notEntitled:
                   summary: Caller role (e.g. a claimed dependent) has no wallet
-                  value: { error: "Failed to fetch wallet balance" }
+                  value: { error: "Failed to fetch wallet balance", detail: "FORBIDDEN" }
         "500":
           $ref: "#/components/responses/InternalError"
         "502":
@@ -1253,9 +2032,10 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Error"
+                $ref: "#/components/schemas/ErrorWithDetail"
               example:
                 error: "Failed to fetch wallet balance"
+                detail: "INTERNAL_SERVER_ERROR"
 
   /wallet/transactions:
     get:
@@ -1582,9 +2362,10 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Error"
+                $ref: "#/components/schemas/ErrorWithDetail"
               example:
                 error: "Could not create top-up transaction"
+                detail: "{\"error\":\"No wallet found for this account\"}"
         "500":
           description: >-
             Could not reach Salesforce at all, or the Salesforce transaction was
@@ -1615,13 +2396,14 @@ paths:
             application/json:
               schema:
                 anyOf:
-                  - $ref: "#/components/schemas/Error"
+                  - $ref: "#/components/schemas/ErrorWithDetail"
                   - $ref: "#/components/schemas/TopUpPartialFailure"
               examples:
                 salesforceRejected:
                   summary: Salesforce Apex REST call failed, e.g. caller isn't a Sponsor
                   value:
                     error: "Could not create top-up transaction"
+                    detail: "{\"error\":\"This action requires role: Sponsor\"}"
                 flutterwaveRejected:
                   summary: Salesforce transaction created, but Flutterwave itself rejected the payment
                   value:
@@ -1718,10 +2500,10 @@ paths:
                     Wrong relationship for the role (not the caller's own
                     contactId, not their dependent, or — for a provider — no
                     matching visit on file with this patient)
-                  value: { error: "Failed to fetch medical record" }
+                  value: { error: "Failed to fetch medical record", detail: "{\"error\":\"Not authorized to view this medical record\"}" }
                 payerAccessRevoked:
                   summary: Sponsor's access to this specific patient's record was explicitly revoked
-                  value: { error: "Failed to fetch medical record" }
+                  value: { error: "Failed to fetch medical record", detail: "{\"error\":\"Payer access has been revoked for this record\"}" }
         "404":
           description: >-
             No medical record exists yet for that Contact — expected until one is
@@ -1729,9 +2511,10 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Error"
+                $ref: "#/components/schemas/ErrorWithDetail"
               example:
                 error: "Failed to fetch medical record"
+                detail: "NOT_FOUND"
         "500":
           $ref: "#/components/responses/InternalError"
         "502":
@@ -1739,9 +2522,10 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Error"
+                $ref: "#/components/schemas/ErrorWithDetail"
               example:
                 error: "Failed to fetch medical record"
+                detail: "INTERNAL_SERVER_ERROR"
 
 components:
   securitySchemes:
@@ -1757,6 +2541,16 @@ components:
         claims — see `CallerIdentity` — which several endpoints additionally
         require to be present, returning `403 Registration incomplete` otherwise.
 
+    internalSecret:
+      type: apiKey
+      in: header
+      name: x-internal-secret
+      description: >-
+        A shared secret, NOT a Firebase credential — used only by
+        `POST /internal/send-push`, which Salesforce's `PushNotificationSender`
+        calls server-to-server. Must match the `INTERNAL_PUSH_SECRET`
+        environment variable configured on Render exactly. This scheme is not
+        part of the mobile app's authentication model at all.
 
   schemas:
     HealthStatus:
@@ -1784,7 +2578,32 @@ components:
           type: string
           description: Human-readable error message.
 
+    ErrorWithDetail:
+      description: >-
+        An Error whose `detail` field carries the raw response body (or a short
+        code) from the upstream Salesforce Apex REST call.
+      allOf:
+        - $ref: "#/components/schemas/Error"
+        - type: object
+          properties:
+            detail:
+              type: string
 
+    DeadDeviceTokenError:
+      description: >-
+        Returned by `POST /internal/send-push` when FCM reports the target
+        device token is fake, expired, or the app was uninstalled — distinct
+        from other failures so the Apex caller can clear the stored token
+        instead of retrying against one that will never work.
+      allOf:
+        - $ref: "#/components/schemas/Error"
+        - type: object
+          required: [code]
+          properties:
+            code:
+              type: string
+              description: The raw FCM error code.
+              examples: ["messaging/invalid-registration-token", "messaging/registration-token-not-registered"]
 
     PartialSuccessError:
       description: >-
@@ -1807,6 +2626,15 @@ components:
       properties:
         success: { type: boolean, const: true }
 
+    PushSendResult:
+      description: Success response for `POST /internal/send-push`.
+      type: object
+      required: [success, messageId]
+      properties:
+        success: { type: boolean, const: true }
+        messageId:
+          type: string
+          description: The FCM message id, as returned by `admin.messaging().send()`.
 
     CustomTokenResponse:
       type: object
@@ -2076,6 +2904,104 @@ components:
         totalDispatches: { type: [integer, "null"], description: Null today. }
         averageResponseTimeMins: { type: [integer, "null"], description: Null today. }
 
+    ProviderAvailabilityRequest:
+      type: object
+      additionalProperties: false
+      required: [onDuty]
+      properties:
+        onDuty:
+          type: boolean
+          description: "`false` always results in `Off Duty`."
+        availabilityStatus:
+          type: string
+          enum: [Available, Busy, Off Duty]
+          description: "Optional. Defaults to `Available` when on duty. `Off Duty` is not allowed together with `onDuty: true`."
+    ProviderAvailability:
+      type: object
+      required: [onDuty, availabilityStatus]
+      properties:
+        onDuty:
+          type: boolean
+        availabilityStatus:
+          type: string
+          enum: [Available, Busy, Off Duty]
+    ProviderLocationRequest:
+      type: object
+      additionalProperties: false
+      required: [latitude, longitude]
+      properties:
+        latitude:
+          type: number
+          minimum: -90
+          maximum: 90
+        longitude:
+          type: number
+          minimum: -180
+          maximum: 180
+      description: Exactly `0,0` is rejected as a placeholder.
+    ProviderLocationUpdated:
+      type: object
+      required: [updatedAt]
+      properties:
+        updatedAt:
+          type: string
+          format: date-time
+          description: When the position was saved (UTC, millisecond precision).
+    ProviderWriteError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+        code:
+          type: string
+          enum: [INVALID_REQUEST, NOT_VETTED, STATUS_CONFLICT, INVALID_LOCATION, RATE_LIMITED, NOT_ACCEPTABLE, NOT_REJECTABLE]
+    DispatchListItem:
+      type: object
+      required: [id, careRequestId, status, landmark, symptoms, distanceKm, secondsLeft, phone, latitude, longitude]
+      properties:
+        id:
+          type: string
+          description: Dispatch id, for `accept`/`reject`.
+        careRequestId:
+          type: string
+        status:
+          type: string
+          enum: [Pending, Accepted]
+        landmark:
+          type: [string, "null"]
+        symptoms:
+          type: [string, "null"]
+        distanceKm:
+          type: [number, "null"]
+          description: Pending only; null on an Accepted row, and null if either side has no GPS yet.
+        secondsLeft:
+          type: [integer, "null"]
+          description: Pending only; null on an Accepted row, floored at 0, and null if the window has no start time yet.
+        phone:
+          type: [string, "null"]
+          description: Accepted only; null on a Pending row.
+        latitude:
+          type: [number, "null"]
+          description: Accepted only; null on a Pending row.
+        longitude:
+          type: [number, "null"]
+          description: Accepted only; null on a Pending row.
+    DispatchList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/DispatchListItem"
+    DispatchActionResult:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [Accepted, Declined]
     CareRequestEligibility:
       description: Advisory result of `GET /care-requests/eligibility`. Enforcement stays in Salesforce at create time.
       type: object
@@ -2091,6 +3017,125 @@ components:
           type: [string, "null"]
           description: Raw subscription status (e.g. "Paused/ Suspended"). For display or logging only; never branch on it, use reasonCode.
 
+    CreateCareRequestBody:
+      type: object
+      required: [symptoms, latitude, longitude]
+      properties:
+        patientContactId:
+          type: string
+          description: Sponsors only, to request for a dependent. Omit to request for yourself. A Patient may only send their own id.
+          example: "003XX00001QMgFvYAL"
+        symptoms:
+          type: string
+          maxLength: 2000
+          example: "Fever and headache since yesterday"
+        landmark:
+          type: string
+          maxLength: 255
+          example: "Near the Waterside market"
+        latitude:
+          type: number
+          minimum: -90
+          maximum: 90
+          description: The PATIENT's latitude (never the sponsor's device). Must be inside the service area.
+          example: 6.3005
+        longitude:
+          type: number
+          minimum: -180
+          maximum: 180
+          description: The PATIENT's longitude (never the sponsor's device). Must be inside the service area.
+          example: -10.7969
+    CareRequestCreated:
+      type: object
+      required: [id, status, confirmationCode, createdAt, dispatchState]
+      properties:
+        id:
+          type: string
+          example: "a0dXX000001AbCdYAK"
+        status:
+          type: string
+          description: Status right after creation (Submitted or Dispatched); on a replay it may have moved on.
+          example: "Dispatched"
+        confirmationCode:
+          type: [string, "null"]
+          description: 6-character code the patient shows the provider.
+          example: "K7Q2ZM"
+        createdAt:
+          type: string
+          format: date-time
+          example: "2026-09-30T08:15:00.000Z"
+        dispatchState:
+          type: [string, "null"]
+          enum: [PENDING_DISPATCH, DISPATCHED, null]
+          description: PENDING_DISPATCH means saved and still finding a provider; DISPATCHED means a provider was notified. Null on a replay once the request has moved on. Neither means a provider accepted.
+    CareRequestError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+        code:
+          type: string
+          enum: [INVALID_REQUEST, PATIENT_NOT_FOUND, OPEN_REQUEST_EXISTS, NOT_ELIGIBLE, IDEMPOTENCY_KEY_CONFLICT, OUTSIDE_SERVICE_AREA, UNEXPECTED_STATE]
+        existingRequestId:
+          type: string
+          description: With OPEN_REQUEST_EXISTS, the request to open instead of creating another.
+        reasonCode:
+          type: string
+          description: With NOT_ELIGIBLE, see the endpoint description for the list.
+        id:
+          type: string
+          description: With UNEXPECTED_STATE, the request that was created.
+        status:
+          type: string
+          description: With UNEXPECTED_STATE, its status.
+    CareRequestPatientRef:
+      type: object
+      required: [id, name]
+      properties:
+        id: { type: string, example: "003XX00001PhybaYAB" }
+        name: { type: [string, "null"], example: "Anthony Doe" }
+    CareRequestProviderCard:
+      type: [object, "null"]
+      description: Null until a provider is assigned. Never includes phone or location.
+      properties:
+        name: { type: [string, "null"], example: "Dora Doc" }
+        type: { type: [string, "null"], example: "Doctor" }
+        rating: { type: [number, "null"], example: 4.5 }
+    CareRequestListItem:
+      type: object
+      required: [id, status, createdAt, patient, provider]
+      properties:
+        id: { type: string, example: "a2vXX000001AbCdYAK" }
+        status: { type: string, example: "Dispatched" }
+        createdAt: { type: string, format: date-time }
+        patient: { $ref: "#/components/schemas/CareRequestPatientRef" }
+        provider: { $ref: "#/components/schemas/CareRequestProviderCard" }
+    CareRequestList:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/CareRequestListItem" }
+        nextCursor:
+          type: [string, "null"]
+          description: Null on the last page.
+    CareRequestDetail:
+      type: object
+      required: [id, status, createdAt, symptoms, landmark, patient, provider, confirmationCode]
+      properties:
+        id: { type: string, example: "a2vXX000001AbCdYAK" }
+        status: { type: string, example: "Dispatched" }
+        createdAt: { type: string, format: date-time }
+        symptoms: { type: [string, "null"] }
+        landmark: { type: [string, "null"] }
+        patient: { $ref: "#/components/schemas/CareRequestPatientRef" }
+        provider: { $ref: "#/components/schemas/CareRequestProviderCard" }
+        confirmationCode:
+          type: [string, "null"]
+          description: Only while the status is Submitted, Dispatched or Provider Accepted; null in every other status.
+          example: "K7Q2ZM"
     WalletTopUpStatus:
       description: >-
         Response of `GET /wallet/topups/{reference}`. No currency field: it is
